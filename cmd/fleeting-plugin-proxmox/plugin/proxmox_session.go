@@ -46,7 +46,10 @@ func (ig *InstanceGroup) refreshSessionTicket(ctx context.Context) error {
 		return fmt.Errorf("could not read credentials: %w", err)
 	}
 
-	_, err = ig.proxmox.Ticket(ctx, credentials)
+	// Ticket auth only: an API-token client holds no session, so the refresher never
+	// runs for it. Re-read the file so a rotated password is picked up, then exchange
+	// it for a fresh ticket.
+	_, err = ig.proxmox.Ticket(ctx, credentials.credentials())
 	if err != nil {
 		return fmt.Errorf("failed to create proxmox ticket: %w", err)
 	}

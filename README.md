@@ -46,13 +46,24 @@ The following image tags are available:
 
 ### Credentials file
 
-<!-- TODO: Document `path` and `privs`  -->
-| Parameter  | Type   | Description               |
-| ---------- | ------ | ------------------------- |
-| `realm`    | string | Authentication Realm      |
-| `username` | string | User name                 |
-| `password` | string | User password             |
-| `otp`      | string | One-time password for 2FA |
+The credentials file selects the authentication method:
+
+- **API token (recommended):** set `username`, `realm`, `token_id` and `token_secret`.
+  The token is a static secret attached to every request, so the client holds no session
+  and there is no ticket to refresh. Create one with
+  `pveum user token add <user> --tokenid <token_id>`; the printed secret is `token_secret`.
+- **Ticket (username + password):** set `username` and `password` (with `realm` and
+  optional `otp`). The plugin exchanges them for a session ticket and renews it hourly.
+  This remains supported for backwards compatibility.
+
+| Parameter      | Type   | Description                          |
+| -------------- | ------ | ------------------------------------ |
+| `realm`        | string | Authentication realm                 |
+| `username`     | string | User name                            |
+| `password`     | string | User password (ticket auth)          |
+| `otp`          | string | One-time password for 2FA (ticket)   |
+| `token_id`     | string | API token id (token auth)            |
+| `token_secret` | string | API token secret (token auth)        |
 
 ### Template VM configuration
 

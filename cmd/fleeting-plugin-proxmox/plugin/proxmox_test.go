@@ -2,9 +2,13 @@ package plugin
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"testing"
+	"time"
 
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
@@ -19,6 +23,9 @@ const (
 	proxmoxTestTemplate        = "template"
 	proxmoxTestPools           = "/pools"
 	proxmoxTestStatusCurrent   = "/status/current"
+	proxmoxTestTokenID         = "mytoken"
+	proxmoxTestRealm           = "pam"
+	proxmoxTestUsername        = "root"
 )
 
 func TestInstanceGroup_getProxmoxClient(t *testing.T) {
@@ -40,6 +47,133 @@ func TestInstanceGroup_getProxmoxClient(t *testing.T) {
 
 	_, err = ig.getProxmoxClient()
 	require.NoError(t, err)
+}
+
+func TestProxmoxCredentialsFile_tokenAuthID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		file    proxmoxCredentialsFile
+		wantID  string
+		wantErr bool
+	}{
+		{
+			name:   "plain username and realm",
+			file:   proxmoxCredentialsFile{Realm: proxmoxTestRealm, Username: proxmoxTestUsername, TokenID: proxmoxTestTokenID, TokenSecret: "s"},
+			wantID: "root@pam!" + proxmoxTestTokenID,
+		},
+		{
+			name:   "username already carries realm",
+			file:   proxmoxCredentialsFile{Realm: proxmoxTestRealm, Username: "root@pam", TokenID: proxmoxTestTokenID, TokenSecret: "s"},
+			wantID: "root@pam!" + proxmoxTestTokenID,
+		},
+		{
+			name:   "empty realm",
+			file:   proxmoxCredentialsFile{Username: "root@pve", TokenID: "ci", TokenSecret: "s"},
+			wantID: "root@pve!ci",
+		},
+		{
+			name:    "missing token id",
+			file:    proxmoxCredentialsFile{Realm: proxmoxTestRealm, Username: proxmoxTestUsername, TokenSecret: "s"},
+			wantErr: true,
+		},
+		{
+			name:    "missing secret",
+			file:    proxmoxCredentialsFile{Realm: proxmoxTestRealm, Username: proxmoxTestUsername, TokenID: proxmoxTestTokenID},
+			wantErr: true,
+		},
+		{
+			name:    "missing username",
+			file:    proxmoxCredentialsFile{Realm: proxmoxTestRealm, TokenID: proxmoxTestTokenID, TokenSecret: "s"},
+			wantErr: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			tokenID, err := testCase.file.tokenAuthID()
+			if testCase.wantErr {
+				require.Error(t, err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, testCase.wantID, tokenID)
+		})
+	}
+}
+
+func TestProxmoxCredentialsFile_tokenAuth(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, (&proxmoxCredentialsFile{Realm: proxmoxTestRealm, Username: proxmoxTestUsername, Password: "s"}).tokenAuth())
+	require.True(t, (&proxmoxCredentialsFile{Realm: proxmoxTestRealm, Username: proxmoxTestUsername, TokenID: proxmoxTestTokenID, TokenSecret: "s"}).tokenAuth())
+}
+
+// A token-authenticated client must send the Authorization header and must not
+// open a ticket session; a ticket-authenticated client must not send it.
+func TestInstanceGroup_getProxmoxClient_authMode(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name           string
+		credentials    string
+		wantTokenAuth  bool
+		wantAuthHeader string
+	}{
+		//nolint:gosec//G101 // test fixture, not a real secret
+		{
+			name:           "token auth sends PVEAPIToken header",
+			credentials:    `{"realm": "pam","username": "root","token_id": "mytoken","token_secret": "s3cret"}`,
+			wantTokenAuth:  true,
+			wantAuthHeader: "PVEAPIToken=root@pam!mytoken=s3cret",
+		},
+		//nolint:gosec//G101 // test fixture, not a real secret
+		{
+			name:           "ticket auth sends no token header",
+			credentials:    `{"realm": "pam","username": "root","password": "s3cret"}`,
+			wantTokenAuth:  false,
+			wantAuthHeader: "",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			authHeader := make(chan string, 1)
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				authHeader <- request.Header.Get("Authorization")
+
+				fmt.Fprint(w, `{"data":{"version":"8.0","repoid":"test","supportrepo":"test","versiondate":"0"}}`)
+			}))
+			t.Cleanup(server.Close)
+
+			tempDir := t.TempDir()
+			ig := InstanceGroup{
+				URL:                 server.URL,
+				CredentialsFilePath: path.Join(tempDir, "prox_credentials.json"),
+			}
+
+			require.NoError(t, os.WriteFile(ig.CredentialsFilePath, []byte(testCase.credentials), 0o600))
+
+			client, err := ig.getProxmoxClient()
+			require.NoError(t, err)
+			require.Equal(t, testCase.wantTokenAuth, ig.usingTokenAuth)
+
+			_, _ = client.Version(context.Background())
+
+			select {
+			case got := <-authHeader:
+				require.Equal(t, testCase.wantAuthHeader, got)
+			case <-time.After(2 * time.Second):
+				t.Fatal("no request reached the server")
+			}
+		})
+	}
 }
 
 func TestOwnedInstance(t *testing.T) {

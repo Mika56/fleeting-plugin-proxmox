@@ -41,6 +41,11 @@ type InstanceGroup struct {
 	log     hclog.Logger    `json:"-"`
 	proxmox *proxmox.Client `json:"-"`
 
+	// True when the client authenticates with a PVE API token instead of a ticket
+	// session. Token auth carries no session state, so there is no ticket to refresh
+	// and the session ticket refresher is not started.
+	usingTokenAuth bool `json:"-"`
+
 	// This mutex is used when cloning template for new instances. It is required for blocking other
 	// operations like collection or update, because when new instance is created with recycled ID then for
 	// a brief period it will be reported from Proxmox with old name (e.g. InstanceNameRemoving).
@@ -99,8 +104,12 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	//nolint:contextcheck
 	ig.startRemovedInstanceCollector()
 
-	//nolint:contextcheck
-	ig.startSessionTicketRefresher()
+	// A ticket session needs periodic renewal; an API token is a static secret and
+	// holds no session, so the refresher is only started for ticket auth.
+	if !ig.usingTokenAuth {
+		//nolint:contextcheck
+		ig.startSessionTicketRefresher()
+	}
 
 	return provider.ProviderInfo{
 		ID:      ig.Pool,
@@ -109,8 +118,10 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 }
 
 // Shutdown implements provider.InstanceGroup. It is safe to call repeatedly, and safe to call
-// before Init.
-func (ig *InstanceGroup) Shutdown(_ context.Context) error {
+// before Init. It returns ctx.Err() if ctx expires before the workers have drained; the
+// workers keep running and drain on their own bounded contexts, so a worker blocked on a stuck
+// Proxmox API call cannot hold the shutdown hostage.
+func (ig *InstanceGroup) Shutdown(ctx context.Context) error {
 	// Before Init there is nothing to close and nothing to wait for, and closing a nil channel
 	// would panic and take the plugin process down. Both channels are only ever created
 	// together in resetLifecycle, so one check covers them. The check stays outside the guard as
@@ -128,10 +139,34 @@ func (ig *InstanceGroup) Shutdown(_ context.Context) error {
 		close(ig.sessionTicketRefresherShutdownTrigger)
 	})
 
-	ig.collectorWaitGroup.Wait()
-	ig.sessionTicketRefresherWaitGroup.Wait()
+	err := waitGroups(ctx, &ig.collectorWaitGroup, &ig.sessionTicketRefresherWaitGroup)
+	if err != nil {
+		return fmt.Errorf("timed out waiting for workers to drain: %w", err)
+	}
 
 	return nil
+}
+
+// waitGroups waits for every wait group to drain or for ctx to expire, whichever comes first.
+// On ctx expiry the drain is left to the workers' own bounded contexts; the goroutine left
+// behind exits as soon as they do.
+func waitGroups(ctx context.Context, groups ...*sync.WaitGroup) error {
+	done := make(chan struct{})
+
+	go func() {
+		for _, group := range groups {
+			group.Wait()
+		}
+
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("shutdown context expired before workers drained: %w", ctx.Err())
+	case <-done:
+		return nil
+	}
 }
 
 // runParallel calls run once for every index in [0, count), returning each call's error in

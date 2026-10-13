@@ -54,14 +54,14 @@ func printVersion() {
 	info, ok := debug.ReadBuildInfo()
 	if ok {
 		version.Version = info.Main.Version
-	}
 
-	for _, setting := range info.Settings {
-		switch setting.Key {
-		case "vcs.revision":
-			version.Revision = setting.Value
-		case "vcs.time":
-			version.BuiltAt = setting.Value
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				version.Revision = setting.Value
+			case "vcs.time":
+				version.BuiltAt = setting.Value
+			}
 		}
 	}
 

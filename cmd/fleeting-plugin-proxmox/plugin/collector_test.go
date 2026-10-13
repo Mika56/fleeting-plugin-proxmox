@@ -2,11 +2,15 @@ package plugin
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
 )
@@ -290,6 +294,55 @@ func TestCollectorStopsOnShutdown(t *testing.T) {
 	ig.startRemovedInstanceCollector()
 
 	requireShutdownReturns(t, ig, "with the collector running")
+}
+
+// A Shutdown whose context expires before the workers drain must return the context error
+// instead of waiting: a collector blocked on a stuck Proxmox pool fetch must not hold the
+// shutdown hostage.
+func TestShutdownReturnsOnContextExpiration(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+
+	poolFetches := &atomic.Int64{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.URL.Path, "/pools") {
+			poolFetches.Add(1)
+			<-release
+
+			fmt.Fprint(writer, `{"data":[]}`)
+
+			return
+		}
+
+		http.NotFound(writer, request)
+	}))
+
+	// Cleanups run LIFO: release the hung pool fetch before closing the server, or
+	// server.Close() blocks waiting for the still-active connection.
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+
+	ig := &InstanceGroup{}
+	ig.resetLifecycle()
+	ig.log = hclog.NewNullLogger()
+	ig.Pool = "test-pool"
+	ig.proxmox = proxmox.NewClient(server.URL)
+
+	ig.startRemovedInstanceCollector()
+
+	require.Eventually(t, func() bool { return poolFetches.Load() > 0 }, 2*time.Second, 10*time.Millisecond,
+		"the collector never started its first pool fetch")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := ig.Shutdown(ctx)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 2*time.Second, "Shutdown did not return when the context expired")
 }
 
 // An empty channel accepts the wake-up: triggerCollection never drops it.
