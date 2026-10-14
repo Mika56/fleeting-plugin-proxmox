@@ -31,6 +31,12 @@ var (
 const (
 	networkCheckTimeout = 5 * time.Second
 	networkCheckRetries = 12
+
+	// maxParallelInstanceOperations bounds how many operations one batch runs at once. A batch
+	// is as large as the pool -- every Increase, every mark-for-removal sweep, every resume
+	// or suspend -- and an unbounded fan-out would open one HTTP connection and one task
+	// poller per instance, whatever the pool's size.
+	maxParallelInstanceOperations = 16
 )
 
 type InstanceGroup struct {
@@ -65,6 +71,13 @@ type InstanceGroup struct {
 
 	// Wait group for session ticket refresher.
 	sessionTicketRefresherWaitGroup sync.WaitGroup `json:"-"`
+
+	// poolCacheMu guards poolCache and poolCacheAt: the short-lived pool listing the
+	// per-instance lookups (ConnectInfo, Heartbeat, resume, suspend) share. resetLifecycle
+	// drops it, because a re-Init replaces the client the listing was fetched with.
+	poolCacheMu sync.Mutex    `json:"-"`
+	poolCache   *proxmox.Pool `json:"-"`
+	poolCacheAt time.Time     `json:"-"`
 
 	// Guards the channel closes; re-armed by resetLifecycle.
 	shutdownOnce sync.Once `json:"-"`
@@ -182,11 +195,26 @@ func runParallel(count int, run func(index int) error) []error {
 
 	errs := make([]error, count)
 
-	for index := range count {
+	// A bounded pool of workers instead of one goroutine per slot: the batch can be as
+	// large as the pool, and the cap keeps its fan-out -- and the HTTP connections and
+	// task pollers behind it -- at a constant size.
+	workers := min(count, maxParallelInstanceOperations)
+
+	indexes := make(chan int)
+
+	for range workers {
 		waitGroup.Go(func() {
-			errs[index] = runRecovering(index, run)
+			for index := range indexes {
+				errs[index] = runRecovering(index, run)
+			}
 		})
 	}
+
+	for index := range count {
+		indexes <- index
+	}
+
+	close(indexes)
 
 	waitGroup.Wait()
 
@@ -382,75 +410,69 @@ func (ig *InstanceGroup) Heartbeat(ctx context.Context, instance string) error {
 	return nil
 }
 
+// Resume implements provider.InstanceGroup. The batch shares one pool listing, and the
+// per-instance work runs in parallel under the batch cap: resume is a fire-and-forget
+// request, so nothing waits on a task.
 func (ig *InstanceGroup) Resume(ctx context.Context, instances []string) ([]string, error) {
-	var succeeded []string
+	vms, errs := ig.resolveOwnedInstances(ctx, instances)
 
-	var errs []string
-
-	for _, instance := range instances {
-		vmid, err := strconv.Atoi(instance)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("invalid vm id '%s'", instance))
-
-			continue
+	errs = runParallel(len(instances), func(index int) error {
+		if errs[index] != nil {
+			return errs[index]
 		}
 
-		vm, err := ig.ownedInstance(ctx, vmid)
+		_, err := vms[index].Resume(ctx)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("vm id '%d': %v", vmid, err))
-
-			continue
+			return fmt.Errorf("resume api call failed for vm id '%d': %w", vms[index].VMID, err)
 		}
 
-		_, err = vm.Resume(ctx)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("resume api call failed for vm id '%d'", vmid))
+		return nil
+	})
 
-			continue
-		}
-
-		succeeded = append(succeeded, instance)
-	}
-
-	if len(errs) > 0 {
-		return succeeded, fmt.Errorf("%w: %s", ErrResumeFailed, strings.Join(errs, ", "))
-	}
-
-	return succeeded, nil
+	return suspendResumeOutcome(instances, errs, ErrResumeFailed)
 }
 
+// Suspend implements provider.InstanceGroup, with the same shape as Resume.
 func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]string, error) {
-	var succeeded []string
+	vms, errs := ig.resolveOwnedInstances(ctx, instances)
 
-	var errs []string
+	errs = runParallel(len(instances), func(index int) error {
+		if errs[index] != nil {
+			return errs[index]
+		}
 
-	for _, instance := range instances {
-		vmid, err := strconv.Atoi(instance)
+		_, err := vms[index].Pause(ctx)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("invalid vm id '%s'", instance))
+			return fmt.Errorf("pause api call failed for vm id '%d': %w", vms[index].VMID, err)
+		}
+
+		return nil
+	})
+
+	return suspendResumeOutcome(instances, errs, ErrSuspendFailed)
+}
+
+// suspendResumeOutcome reports a batch of resume or suspend attempts the way the provisioner
+// expects: the ids whose attempt was accepted, and, when anything failed, an error wrapping
+// the operation's sentinel with every attempt's message.
+func suspendResumeOutcome(instances []string, errs []error, sentinel error) ([]string, error) {
+	var (
+		succeeded []string
+		failed    []string
+	)
+
+	for index, instance := range instances {
+		if errs[index] == nil {
+			succeeded = append(succeeded, instance)
 
 			continue
 		}
 
-		vm, err := ig.ownedInstance(ctx, vmid)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("vm id '%d': %v", vmid, err))
-
-			continue
-		}
-
-		_, err = vm.Pause(ctx)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("pause api call failed for vm id '%d'", vmid))
-
-			continue
-		}
-
-		succeeded = append(succeeded, instance)
+		failed = append(failed, errs[index].Error())
 	}
 
-	if len(errs) > 0 {
-		return succeeded, fmt.Errorf("%w: %s", ErrSuspendFailed, strings.Join(errs, ", "))
+	if len(failed) > 0 {
+		return succeeded, fmt.Errorf("%w: %s", sentinel, strings.Join(failed, ", "))
 	}
 
 	return succeeded, nil
@@ -466,6 +488,13 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 // group can be initialised again after a Shutdown without the previous cycle's guard blocking
 // the next one.
 func (ig *InstanceGroup) resetLifecycle() {
+	// A re-Init replaces the Proxmox client, and a listing fetched with the previous one
+	// is no evidence about the new one.
+	ig.poolCacheMu.Lock()
+	ig.poolCache = nil
+	ig.poolCacheAt = time.Time{}
+	ig.poolCacheMu.Unlock()
+
 	// Channels only exist after the first reset, and they are created together, so one
 	// check covers both.
 	if ig.collectorShutdownTrigger != nil {
