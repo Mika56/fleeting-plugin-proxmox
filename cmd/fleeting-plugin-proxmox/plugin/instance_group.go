@@ -456,11 +456,30 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 	return succeeded, nil
 }
 
-// resetLifecycle creates the worker channels and re-arms the shutdown guard. The wait groups
-// Shutdown waits on need no reset -- a sync.WaitGroup is reusable once Wait has returned -- but
-// everything Shutdown closes is created here, so a group can be initialised again after a
-// Shutdown without the previous cycle's guard blocking the next one.
+// resetLifecycle creates the worker channels and re-arms the shutdown guard. A reset with a
+// live previous cycle -- an Init without a Shutdown in between -- first stops that cycle's
+// workers: without it they would block forever on the channels about to be replaced, and
+// their wait group counts would make the next Shutdown hang. The previous cycle's
+// shutdownOnce is the per-cycle guard, so exactly one of Shutdown or this reset closes its
+// triggers, never both. The wait groups themselves need no reset -- a sync.WaitGroup is
+// reusable once Wait has returned -- but everything Shutdown closes is created here, so a
+// group can be initialised again after a Shutdown without the previous cycle's guard blocking
+// the next one.
 func (ig *InstanceGroup) resetLifecycle() {
+	// Channels only exist after the first reset, and they are created together, so one
+	// check covers both.
+	if ig.collectorShutdownTrigger != nil {
+		ig.shutdownOnce.Do(func() {
+			close(ig.collectorShutdownTrigger)
+			close(ig.sessionTicketRefresherShutdownTrigger)
+		})
+
+		// The workers drain on their own bounded contexts, so this returns once the
+		// previous cycle's in-flight work finishes.
+		ig.collectorWaitGroup.Wait()
+		ig.sessionTicketRefresherWaitGroup.Wait()
+	}
+
 	ig.instanceCollectionTrigger = make(chan struct{}, 1)
 	ig.collectorShutdownTrigger = make(chan struct{})
 	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{})
@@ -510,7 +529,14 @@ func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance stri
 		internalAddress, externalAddress, err := determineAddresses(networkInterfaces, ig.InstanceNetworkInterface, ig.InstanceNetworkProtocol)
 		if err != nil {
 			ig.log.Error("failed to get network interface", "retry", retry, "vmid", vm.VMID, "err", err)
-			time.Sleep(networkCheckTimeout)
+
+			// A canceled ConnectInfo must not sit out the retry sleep: the caller is gone, so
+			// report the cancellation instead of burning up to networkCheckTimeout per retry.
+			select {
+			case <-ctx.Done():
+				return provider.ConnectInfo{}, fmt.Errorf("waiting for instance vmid='%d' network interfaces: %w", vm.VMID, ctx.Err())
+			case <-time.After(networkCheckTimeout):
+			}
 
 			continue
 		}

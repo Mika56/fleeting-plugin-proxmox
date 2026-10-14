@@ -97,6 +97,67 @@ func TestShutdownAfterInitCycleDoesNotHang(t *testing.T) {
 	}
 }
 
+// An Init without a Shutdown in between must not leak the previous cycle's workers: the new
+// lifecycle stops them before handing out fresh channels, and the next Shutdown then drains
+// only the current cycle.
+func TestInitWithoutShutdownStopsPreviousWorkers(t *testing.T) {
+	t.Parallel()
+
+	ig := &InstanceGroup{}
+
+	// Cycle one: a collector and a refresher that capture their triggers the way the real
+	// workers' selects do on entry, and report when they exit.
+	ig.resetLifecycle()
+
+	ready := make(chan struct{}, 2)
+	cycleOneCollectorDone := make(chan struct{})
+	cycleOneRefresherDone := make(chan struct{})
+
+	ig.collectorWaitGroup.Go(func() {
+		trigger := ig.collectorShutdownTrigger
+
+		ready <- struct{}{}
+
+		defer close(cycleOneCollectorDone)
+
+		<-trigger
+	})
+
+	ig.sessionTicketRefresherWaitGroup.Go(func() {
+		trigger := ig.sessionTicketRefresherShutdownTrigger
+
+		ready <- struct{}{}
+
+		defer close(cycleOneRefresherDone)
+
+		<-trigger
+	})
+
+	<-ready
+	<-ready
+
+	// Cycle two, with no Shutdown in between: the previous workers must be stopped before
+	// their channels go away.
+	ig.resetLifecycle()
+
+	select {
+	case <-cycleOneCollectorDone:
+	case <-time.After(time.Second):
+		t.Fatal("the previous collector was not stopped by the second reset")
+	}
+
+	select {
+	case <-cycleOneRefresherDone:
+	case <-time.After(time.Second):
+		t.Fatal("the previous ticket refresher was not stopped by the second reset")
+	}
+
+	// The wait groups now carry only cycle two, so a fresh cycle shuts down cleanly.
+	startFakeWorkers(ig)
+
+	requireShutdownReturns(t, ig, "after a second reset without a Shutdown")
+}
+
 // requireShutdownReturns fails the test instead of letting the package time out when Shutdown
 // blocks -- a Shutdown that waits on workers nothing ever told to stop never returns at all.
 func requireShutdownReturns(t *testing.T, ig *InstanceGroup, when string) {
@@ -813,6 +874,45 @@ func TestConnectInfo(t *testing.T) {
 
 		require.Equal(t, 2, fetches, "the first fetch must be retried: %v", counts.requestsFor(100))
 		require.Regexp(t, `\[ERROR\].*failed to get network interface.*retry=0`, logBuf.String())
+	})
+
+	// A canceled ConnectInfo must not sit out the retry sleeps: it returns with the
+	// cancellation as soon as the current sleep is interrupted, not after the full retry
+	// budget.
+	t.Run("returns on context cancel during a retry sleep", func(t *testing.T) {
+		t.Parallel()
+
+		ig := newRemovalTestGroup(t, removalTestServer{
+			members: []removalTestMember{{vmid: 100, name: DefaultInstanceNameRunning}},
+			// Every fetch reports only a filtered-out interface, so every retry sleeps.
+			networkIfaceBodies: []string{
+				`{"name":"eth0","hardware-address":"00:00:00:00:00:00","ip-addresses":[{"ip-address-type":"ipv4","ip-address":"192.168.0.1","prefix":24}]}`,
+			},
+		})
+		ig.InstanceNetworkProtocol = NetworkProtocolIPv4
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan error, 1)
+
+		go func() {
+			_, err := ig.ConnectInfo(ctx, "100")
+			done <- err
+		}()
+
+		// Cancel mid first-sleep.
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+
+		// A fixed implementation returns at the cancel; a sleep that ignores ctx cannot
+		// return before the first full retry, so half a retry cleanly separates the two.
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(networkCheckTimeout / 2):
+			t.Fatal("ConnectInfo did not return on context cancellation")
+		}
 	})
 }
 

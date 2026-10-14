@@ -148,6 +148,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"instance_autoresize_disk", s.validateInstanceAutoresizeDisk},
 		{"instance_autoresize_size", s.validateInstanceAutoresizeSize},
 		{"instance_autoresize_consistency", s.validateInstanceAutoresizeConsistency},
+		{"proxmox_task_wait_interval", s.validateProxmoxTaskWaitInterval},
 	}
 
 	for _, v := range validators {
@@ -288,6 +289,21 @@ func (s *Settings) validateInstanceAutoresizeConsistency() error {
 
 	if s.InstanceAutoresizeDisk == "" && s.InstanceAutoresizeSize != "" {
 		return fmt.Errorf("%w: instance_autoresize_disk must have a value when instance_autoresize_size is set", ErrSettingInvalidParameter)
+	}
+
+	return nil
+}
+
+// validateProxmoxTaskWaitInterval checks that the task wait interval is positive. An unset
+// interval is fine -- FillWithDefaults supplies the default -- but a set one of zero or less
+// would make waitTask poll Proxmox's task API with no pause between polls.
+func (s *Settings) validateProxmoxTaskWaitInterval() error {
+	if s.ProxmoxTaskWaitInterval == nil {
+		return nil
+	}
+
+	if *s.ProxmoxTaskWaitInterval <= 0 {
+		return fmt.Errorf("%w: proxmox_task_wait_interval: must be greater than zero", ErrSettingInvalidParameter)
 	}
 
 	return nil

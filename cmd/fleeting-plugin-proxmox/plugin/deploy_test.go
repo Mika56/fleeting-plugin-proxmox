@@ -384,7 +384,7 @@ func TestDeployInstanceConfigFailureLeavesNoRenameBehind(t *testing.T) {
 
 	vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to get instance config")
+	require.Contains(t, err.Error(), "failed to set creating tags on instance")
 	require.Equal(t, deployTestCloneVMID, vmid)
 	require.Empty(t, counts.allConfigs(), "a config failure must not be renamed")
 }
