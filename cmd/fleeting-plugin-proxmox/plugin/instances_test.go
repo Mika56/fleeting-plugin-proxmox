@@ -125,6 +125,9 @@ type removalTestServer struct {
 	// configResponse is the body the rename POST answers with; empty means a task UPID.
 	configResponse string
 
+	// stopUpID is the UPID the stop route answers with; empty means the usual qmstop UPID.
+	stopUpID string
+
 	// members is the pool the fake serves; empty means the one stale instance above.
 	members []removalTestMember
 
@@ -309,6 +312,16 @@ func removalTestTaskStatus(t *testing.T, memberByVMID map[string]removalTestMemb
 	}
 }
 
+// removalTestUpID answers a one-shot task route with a fresh UPID of the named type, letting
+// a test script a malformed one for the stop.
+func removalTestUpID(upIDTaskType string, opts removalTestServer) proxmox.UPID {
+	if upIDTaskType == "qmstop" && opts.stopUpID != "" {
+		return proxmox.UPID(opts.stopUpID)
+	}
+
+	return testUPID(upIDTaskType)
+}
+
 // removalTestFailPath reports whether the request hits one of the fake's injected failure
 // paths.
 func removalTestFailPath(request *http.Request, failPaths []string) bool {
@@ -462,7 +475,7 @@ func removalTestHandler(t *testing.T, opts removalTestServer, counts *removalReq
 
 			taskStatus(writer, request)
 		case isUpIDRoute:
-			fmt.Fprintf(writer, `{"data":%q}`, testUPID(upIDTaskType))
+			fmt.Fprintf(writer, `{"data":%q}`, removalTestUpID(upIDTaskType, opts))
 		case route == "GET status/current":
 			removalTestServeStatus(writer, matched)
 		case route == "GET config":

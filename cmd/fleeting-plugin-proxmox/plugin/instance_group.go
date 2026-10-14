@@ -23,9 +23,10 @@ var (
 	ErrResumeFailed              = errors.New("one or more instances did not resume successfully")
 	ErrSuspendFailed             = errors.New("one or more instances did not suspend successfully")
 
-	// ErrInstanceOperationPanic reports a panic in one parallel instance operation, recovered
-	// so it fails that attempt instead of taking the plugin process down.
-	ErrInstanceOperationPanic = errors.New("instance operation panicked")
+	// ErrPluginPanic reports a panic in one of the plugin's goroutines -- a parallel instance
+	// operation or a background worker -- recovered so it fails or logs instead of taking the
+	// plugin process down.
+	ErrPluginPanic = errors.New("plugin goroutine panicked")
 )
 
 const (
@@ -226,11 +227,17 @@ func runParallel(count int, run func(index int) error) []error {
 func runRecovering(index int, run func(index int) error) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("%w: %v\n%s", ErrInstanceOperationPanic, recovered, debug.Stack())
+			err = fmt.Errorf("%w: %v\n%s", ErrPluginPanic, recovered, debug.Stack())
 		}
 	}()
 
 	return run(index)
+}
+
+// panicError renders a recovered panic with the stack it was captured at, so the log entry
+// stays diagnosable: the value says what happened, the stack says where.
+func panicError(recovered any) error {
+	return fmt.Errorf("%w: %v\n%s", ErrPluginPanic, recovered, debug.Stack())
 }
 
 // Increase implements provider.InstanceGroup.
@@ -476,6 +483,19 @@ func suspendResumeOutcome(instances []string, errs []error, sentinel error) ([]s
 	}
 
 	return succeeded, nil
+}
+
+// runRecoveringLoop runs a background worker loop, and a panic in it -- the vendor client
+// can index past the end of a malformed UPID -- is logged instead of taking the plugin
+// process down. The loop does not restart: a dead worker stays dead, and the log says why.
+func (ig *InstanceGroup) runRecoveringLoop(worker string, loop func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			ig.log.Error(worker+" loop panicked and will not restart", "err", panicError(recovered))
+		}
+	}()
+
+	loop()
 }
 
 // resetLifecycle creates the worker channels and re-arms the shutdown guard. A reset with a

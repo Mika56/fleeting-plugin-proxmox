@@ -22,21 +22,23 @@ func (ig *InstanceGroup) startRemovedInstanceCollector() {
 }
 
 func (ig *InstanceGroup) runRemovedInstanceCollector() {
-	ig.collectRemovedInstances()
+	ig.runRecoveringLoop("removed instance collector", func() {
+		ig.collectRemovedInstances()
 
-	for {
-		select {
-		case <-ig.collectorShutdownTrigger:
-			return
-		case <-time.After(collectionInterval):
-			ig.collectRemovedInstances()
-		case <-ig.instanceCollectionTrigger:
-			// Sleep for a bit to give Proxmox a chance to propagate renames that happened before trigger
-			<-time.After(collectionWaitAfterTrigger)
+		for {
+			select {
+			case <-ig.collectorShutdownTrigger:
+				return
+			case <-time.After(collectionInterval):
+				ig.collectRemovedInstances()
+			case <-ig.instanceCollectionTrigger:
+				// Sleep for a bit to give Proxmox a chance to propagate renames that happened before trigger
+				<-time.After(collectionWaitAfterTrigger)
 
-			ig.collectRemovedInstances()
+				ig.collectRemovedInstances()
+			}
 		}
-	}
+	})
 }
 
 func (ig *InstanceGroup) collectRemovedInstances() {
@@ -80,6 +82,14 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 }
 
 func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.ClusterResource) {
+	// A panic here (the vendor client can index past the end of a malformed UPID) takes
+	// down only this worker: it is logged, and the rest of the collection run proceeds.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			ig.log.Error("collector panicked while removing an instance", "vmid", member.VMID, "err", panicError(recovered))
+		}
+	}()
+
 	vm, usable := ig.fetchToCollect(ctx, &member)
 	if !usable {
 		return
