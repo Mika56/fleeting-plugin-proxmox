@@ -9,10 +9,21 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/luthermonson/go-proxmox"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
+
+// proxmoxRequestTimeout caps a single Proxmox API call. Every long operation
+// (clone, stop, delete, resize) is asynchronous: the call returns a task
+// immediately and completion is polled, so no legitimate request outlives this
+// bound. It exists so a wedged Proxmox (connection accepted, no answer) fails
+// the call after a bounded time instead of blocking the caller -- and, with it,
+// instanceCloningMu and the collector queued behind it -- until the caller's
+// context expires.
+const proxmoxRequestTimeout = 30 * time.Second
 
 var (
 	ErrNotFound = errors.New("not found")
@@ -20,6 +31,13 @@ var (
 	// config's instance names, or, to getListedVM, no longer carries the one it was
 	// listed and selected under.
 	ErrNotOwned = errors.New("not owned by this instance group")
+
+	// ErrTokenAuthMissingTokenID, ErrTokenAuthMissingTokenSecret and
+	// ErrTokenAuthMissingUsername report an incomplete API-token credentials file:
+	// token auth was requested but one of its required fields is absent.
+	ErrTokenAuthMissingTokenID     = errors.New("token auth requires 'token_id'")
+	ErrTokenAuthMissingTokenSecret = errors.New("token auth requires 'token_secret'")
+	ErrTokenAuthMissingUsername    = errors.New("token auth requires 'username'")
 )
 
 func notOwned(vmid uint64, name string) error {
@@ -180,6 +198,62 @@ func (ig *InstanceGroup) getListedVM(ctx context.Context, member *proxmox.Cluste
 	return vm, nil
 }
 
+// proxmoxCredentialsFile is the on-disk Proxmox credentials file. It carries either
+// ticket-auth fields (username + password, with realm) or API-token fields (token_id +
+// token_secret, with username + realm naming the token's user).
+//
+// API-token auth is the preferred method: a token is a static secret attached to every
+// request, so the client holds no session and there is no ticket to refresh. That removes
+// the concurrent session state a ticket session otherwise exposes. Ticket auth remains as
+// a backwards-compatible fallback.
+type proxmoxCredentialsFile struct {
+	Realm       string `json:"realm,omitempty"`
+	Username    string `json:"username,omitempty"`
+	Password    string `json:"password,omitempty"`
+	Otp         string `json:"otp,omitempty"`
+	TokenID     string `json:"token_id,omitempty"`
+	TokenSecret string `json:"token_secret,omitempty"`
+}
+
+// tokenAuth reports whether the file requests API-token authentication.
+func (c *proxmoxCredentialsFile) tokenAuth() bool {
+	return c.TokenID != "" || c.TokenSecret != ""
+}
+
+// tokenAuthID builds the PVE API-token identifier "<user>@<realm>!<token_id>" that
+// go-proxmox's WithAPIToken expects as its first argument. A username that already carries
+// a "@realm" is used as-is, so the realm is not appended twice.
+func (c *proxmoxCredentialsFile) tokenAuthID() (string, error) {
+	if c.TokenID == "" {
+		return "", ErrTokenAuthMissingTokenID
+	}
+
+	if c.TokenSecret == "" {
+		return "", ErrTokenAuthMissingTokenSecret
+	}
+
+	user := c.Username
+	if user == "" {
+		return "", ErrTokenAuthMissingUsername
+	}
+
+	if c.Realm != "" && !strings.Contains(user, "@") {
+		user += "@" + c.Realm
+	}
+
+	return user + "!" + c.TokenID, nil
+}
+
+// credentials converts the file's ticket-auth fields to go-proxmox credentials.
+func (c *proxmoxCredentialsFile) credentials() *proxmox.Credentials {
+	return &proxmox.Credentials{
+		Realm:    c.Realm,
+		Username: c.Username,
+		Password: c.Password,
+		Otp:      c.Otp,
+	}
+}
+
 func (ig *InstanceGroup) getProxmoxClient() (*proxmox.Client, error) {
 	url, err := url.Parse(ig.URL)
 	if err != nil {
@@ -192,6 +266,7 @@ func (ig *InstanceGroup) getProxmoxClient() (*proxmox.Client, error) {
 	}
 
 	httpClient := http.Client{
+		Timeout: proxmoxRequestTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				//nolint:gosec
@@ -200,21 +275,37 @@ func (ig *InstanceGroup) getProxmoxClient() (*proxmox.Client, error) {
 		},
 	}
 
-	return proxmox.NewClient(
-		url.JoinPath("/api2/json").String(),
-		proxmox.WithCredentials(credentials),
+	options := []proxmox.Option{
 		proxmox.WithHTTPClient(&httpClient),
-	), nil
+	}
+
+	if credentials.tokenAuth() {
+		// API-token auth: a static secret on every request, no session to keep alive.
+		tokenID, err := credentials.tokenAuthID()
+		if err != nil {
+			return nil, fmt.Errorf("invalid API-token credentials: %w", err)
+		}
+
+		options = append(options, proxmox.WithAPIToken(tokenID, credentials.TokenSecret))
+		ig.usingTokenAuth = true
+	} else {
+		// Ticket auth: username + password exchanged for a session ticket that the
+		// session ticket refresher keeps alive.
+		options = append(options, proxmox.WithCredentials(credentials.credentials()))
+		ig.usingTokenAuth = false
+	}
+
+	return proxmox.NewClient(url.JoinPath("/api2/json").String(), options...), nil
 }
 
-func (ig *InstanceGroup) getProxmoxCredentials() (*proxmox.Credentials, error) {
+func (ig *InstanceGroup) getProxmoxCredentials() (*proxmoxCredentialsFile, error) {
 	credentialsFile, err := os.Open(ig.CredentialsFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open credentials file from path='%s': %w", ig.CredentialsFilePath, err)
 	}
 	defer credentialsFile.Close()
 
-	credentials := proxmox.Credentials{}
+	credentials := proxmoxCredentialsFile{}
 
 	err = json.NewDecoder(credentialsFile).Decode(&credentials)
 	if err != nil {
