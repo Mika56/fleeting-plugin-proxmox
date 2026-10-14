@@ -246,6 +246,31 @@ func TestCollectInstanceSkipsStopForStoppedVM(t *testing.T) {
 	require.True(t, counts.requested(100, http.MethodDelete, ""), "the stopped VM was not deleted: %v", counts.requestsFor(100))
 }
 
+// A malformed UPID makes the vendor client panic inside the collector's per-instance worker
+// while building the stop task: the panic must be recovered there, or it takes the whole
+// plugin process down.
+func TestCollectRemovedInstancesRecoversWorkerPanic(t *testing.T) {
+	t.Parallel()
+
+	log, logBuf := newLogBuffer(t)
+	counts := &removalRequestCounts{}
+
+	// Seven colon-separated fields: the vendor's NewTask passes its length guard and then
+	// indexes the eighth, panicking on exactly this shape.
+	ig := newRemovalTestGroup(t, removalTestServer{
+		log:      log,
+		members:  []removalTestMember{{vmid: 100, name: DefaultInstanceNameRemoving}},
+		stopUpID: "UPID:pve-node:00001A2B:00000000:00000000:qmstop:100",
+		requests: counts,
+	})
+
+	ig.collectRemovedInstances()
+
+	require.True(t, counts.requested(100, http.MethodPost, "/status/stop"), "the stop was not attempted: %v", counts.requestsFor(100))
+	require.False(t, counts.requested(100, http.MethodDelete, ""), "a VM whose stop panicked was deleted: %v", counts.requestsFor(100))
+	require.Regexp(t, `\[ERROR\].*collector panicked while removing an instance`, logBuf.String())
+}
+
 // The collection trigger is how markInstancesForRemoval wakes the collector: a token on the
 // channel starts another collection run without waiting for the interval.
 func TestCollectorTriggerWakesCollector(t *testing.T) {

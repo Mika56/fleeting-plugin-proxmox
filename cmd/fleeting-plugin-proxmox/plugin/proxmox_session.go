@@ -18,24 +18,26 @@ func (ig *InstanceGroup) startSessionTicketRefresher() {
 }
 
 func (ig *InstanceGroup) runSessionTicketRefresher() {
-	for {
-		select {
-		case <-ig.sessionTicketRefresherShutdownTrigger:
-			return
-		case <-time.After(sessionTicketRefreshInterval):
-			ctx, cancel := context.WithTimeout(context.Background(), sessionTicketRefreshTimeout)
+	ig.runRecoveringLoop("session ticket refresher", func() {
+		for {
+			select {
+			case <-ig.sessionTicketRefresherShutdownTrigger:
+				return
+			case <-time.After(sessionTicketRefreshInterval):
+				ctx, cancel := context.WithTimeout(context.Background(), sessionTicketRefreshTimeout)
 
-			err := ig.refreshSessionTicket(ctx)
+				err := ig.refreshSessionTicket(ctx)
 
-			cancel()
+				cancel()
 
-			if err != nil {
-				ig.log.Error("failed to refresh proxmox session", "err", err)
-			} else {
-				ig.log.Info("refreshed proxmox session")
+				if err != nil {
+					ig.log.Error("failed to refresh proxmox session", "err", err)
+				} else {
+					ig.log.Info("refreshed proxmox session")
+				}
 			}
 		}
-	}
+	})
 }
 
 // refreshSessionTicket re-authenticates the Proxmox client: it re-reads the credentials file

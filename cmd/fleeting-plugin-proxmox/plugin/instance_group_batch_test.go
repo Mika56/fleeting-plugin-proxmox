@@ -89,7 +89,7 @@ func TestRunParallel(t *testing.T) {
 		return nil
 	})
 
-	require.ErrorIs(t, panicked[2], ErrInstanceOperationPanic)
+	require.ErrorIs(t, panicked[2], ErrPluginPanic)
 	require.ErrorContains(t, panicked[2], "boom")
 	require.NoError(t, panicked[0])
 	require.NoError(t, panicked[1])
@@ -131,4 +131,31 @@ func TestRunParallelCapsConcurrency(t *testing.T) {
 	}
 
 	require.LessOrEqual(t, maxInFlight.Load(), int64(maxParallelInstanceOperations))
+}
+
+// A worker loop that panics -- the vendor client can index past the end of a malformed UPID
+// -- must log and return instead of taking the plugin process down.
+func TestRunRecoveringLoopRecoversPanic(t *testing.T) {
+	t.Parallel()
+
+	log, logBuf := newLogBuffer(t)
+
+	ig := &InstanceGroup{log: log}
+
+	done := make(chan struct{})
+
+	go func() {
+		ig.runRecoveringLoop("test worker", func() {
+			panic("boom")
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runRecoveringLoop did not return after the panic")
+	}
+
+	require.Regexp(t, `\[ERROR\].*test worker loop panicked and will not restart`, logBuf.String())
 }
