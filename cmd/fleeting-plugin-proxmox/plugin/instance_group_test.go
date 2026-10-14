@@ -991,6 +991,60 @@ func TestDecreaseIgnoresInstancesNotListedForRemoval(t *testing.T) {
 	require.Empty(t, counts.requestsFor(101))
 }
 
+// A pool member that is not in the removal list is not touched. The listing itself must wait
+// for the cloning mutex: while a clone is in flight, a recycled VMID is reported with its
+// predecessor's stale name, and a snapshot taken in that window would let Decrease report a
+// just-created VM as removed or queue a rename for it.
+func TestDecreaseListsPoolUnderCloningMutex(t *testing.T) {
+	t.Parallel()
+
+	counts := &removalRequestCounts{}
+	ig := newRemovalTestGroup(t, removalTestServer{
+		members:  []removalTestMember{{vmid: 100, name: DefaultInstanceNameRunning}},
+		requests: counts,
+	})
+
+	// Hold the cloning mutex as an in-flight Increase would.
+	ig.instanceCloningMu.Lock()
+
+	type decreaseResult struct {
+		succeeded []string
+		err       error
+	}
+
+	result := make(chan decreaseResult, 1)
+
+	go func() {
+		succeeded, err := ig.Decrease(context.Background(), []string{"100"})
+		result <- decreaseResult{succeeded: succeeded, err: err}
+	}()
+
+	// The pool listing must wait for the mutex. Poll the request log briefly rather than
+	// trusting a fixed sleep: the moment a listing is served while the mutex is held, the
+	// window the mutex exists to close has been read.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if counts.poolRequested() {
+			t.Fatal("Decrease listed the pool while a clone was in flight")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ig.instanceCloningMu.Unlock()
+
+	select {
+	case res := <-result:
+		require.True(t, counts.poolRequested(), "Decrease never listed the pool after the clone finished")
+
+		// The fake's rename task fails by default, so the release unblocked a real listing
+		// that ran to the end rather than a skipped one.
+		require.ErrorIs(t, res.err, ErrTaskFailed)
+	case <-time.After(time.Second):
+		t.Fatal("Decrease did not return after the cloning mutex was released")
+	}
+}
+
 // Init fails fast -- before it sleeps or starts any worker -- when it cannot build the
 // client or cannot list the pool for the stale sweep.
 func TestInitFailsFastWhenItCannotReachProxmox(t *testing.T) {

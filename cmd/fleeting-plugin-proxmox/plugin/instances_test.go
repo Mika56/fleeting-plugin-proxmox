@@ -234,6 +234,18 @@ func (c *removalRequestCounts) requestsFor(vmid uint64) []string {
 	return out
 }
 
+// poolRequested reports whether the fake has served a pool listing yet, so a test can assert
+// that a call is waiting on something -- such as the cloning mutex -- instead of listing the
+// pool.
+func (c *removalRequestCounts) poolRequested() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return slices.ContainsFunc(c.paths, func(p string) bool {
+		return strings.Contains(p, removalTestPools)
+	})
+}
+
 // requested reports whether any recorded request for vmid used method and a path containing
 // substr; an empty method matches any.
 func (c *removalRequestCounts) requested(vmid uint64, method, substr string) bool {
