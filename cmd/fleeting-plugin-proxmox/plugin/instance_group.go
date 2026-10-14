@@ -47,7 +47,7 @@ type InstanceGroup struct {
 	usingTokenAuth bool `json:"-"`
 
 	// This mutex is used when cloning template for new instances. It is required for blocking other
-	// operations like collection or update, because when new instance is created with recycled ID then for
+	// operations like collection, update or decrease, because when new instance is created with recycled ID then for
 	// a brief period it will be reported from Proxmox with old name (e.g. InstanceNameRemoving).
 	instanceCloningMu sync.Mutex `json:"-"`
 
@@ -285,10 +285,21 @@ func (ig *InstanceGroup) ConnectInfo(ctx context.Context, instance string) (prov
 
 // Decrease implements provider.InstanceGroup.
 func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []string) ([]string, error) {
+	// List the pool under the cloning mutex: while a clone is in flight, a recycled VMID is
+	// reported with its predecessor's stale name, and classifying such a member would report a
+	// just-created VM as removed or queue a rename for it. The mutex is dropped before the
+	// per-member work below, which can take minutes -- the same split as the collector -- so a
+	// slow rename cannot stall a clone behind it.
+	ig.instanceCloningMu.Lock()
+
 	pool, err := ig.getProxmoxPool(ctx)
 	if err != nil {
+		ig.instanceCloningMu.Unlock()
+
 		return []string{}, err
 	}
+
+	ig.instanceCloningMu.Unlock()
 
 	var (
 		succeeded = make([]string, 0, len(instancesToRemove))
