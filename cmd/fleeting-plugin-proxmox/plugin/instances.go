@@ -55,7 +55,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		Value: ig.mergedInstanceTags(baseTags, ig.InstanceTagsCreating),
 	})
 	if err != nil {
-		return VMID, fmt.Errorf("failed to get instance config vmid='%d': %w", VMID, err)
+		return VMID, fmt.Errorf("failed to set creating tags on instance vmid='%d': %w", VMID, err)
 	}
 
 	// Start, configure etc.

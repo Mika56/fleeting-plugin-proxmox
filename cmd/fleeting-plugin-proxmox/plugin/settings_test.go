@@ -12,16 +12,17 @@ import (
 var (
 	sampleURL = "https://example.com"
 	//nolint:gosec
-	sampleCredentialsPath      = "/tmp/proxmox_credentials.json"
-	samplePool                 = "sample_pool"
-	sampleStorage              = "sample_storage"
-	sampleTemplateID           = 20
-	sampleMaxInstances         = 7
-	sampleInstanceNameCreating = "proxmox-creating"
-	sampleInstanceNameRunning  = "running-prox"
-	sampleInstanceNameRemoving = "proxve-removing"
-	sampleAutoresizeDisk       = "ide0"
-	sampleAutoresizeSize       = "10G"
+	sampleCredentialsPath         = "/tmp/proxmox_credentials.json"
+	samplePool                    = "sample_pool"
+	sampleStorage                 = "sample_storage"
+	sampleTemplateID              = 20
+	sampleMaxInstances            = 7
+	sampleInstanceNameCreating    = "proxmox-creating"
+	sampleInstanceNameRunning     = "running-prox"
+	sampleInstanceNameRemoving    = "proxve-removing"
+	sampleAutoresizeDisk          = "ide0"
+	sampleAutoresizeSize          = "10G"
+	sampleProxmoxTaskWaitInterval = 5
 )
 
 func TestSettings_fillWithDefaults(t *testing.T) {
@@ -52,6 +53,9 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 
 func TestSettings_checkRequiredFields(t *testing.T) {
 	t.Parallel()
+
+	zeroInterval := 0
+	negativeInterval := -1
 
 	tests := []struct {
 		name          string
@@ -187,6 +191,46 @@ func TestSettings_checkRequiredFields(t *testing.T) {
 				TemplateID:              &sampleTemplateID,
 				MaxInstances:            &sampleMaxInstances,
 				InstanceNetworkProtocol: NetworkProtocolAny,
+			},
+			expectedError: nil,
+		},
+		{
+			// A zero interval would busy-poll Proxmox's task API with no pause between polls.
+			name: "Zero task wait interval",
+			settings: Settings{
+				URL:                     sampleURL,
+				CredentialsFilePath:     sampleCredentialsPath,
+				Pool:                    samplePool,
+				Storage:                 sampleStorage,
+				TemplateID:              &sampleTemplateID,
+				MaxInstances:            &sampleMaxInstances,
+				ProxmoxTaskWaitInterval: &zeroInterval,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Negative task wait interval",
+			settings: Settings{
+				URL:                     sampleURL,
+				CredentialsFilePath:     sampleCredentialsPath,
+				Pool:                    samplePool,
+				Storage:                 sampleStorage,
+				TemplateID:              &sampleTemplateID,
+				MaxInstances:            &sampleMaxInstances,
+				ProxmoxTaskWaitInterval: &negativeInterval,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Valid task wait interval",
+			settings: Settings{
+				URL:                     sampleURL,
+				CredentialsFilePath:     sampleCredentialsPath,
+				Pool:                    samplePool,
+				Storage:                 sampleStorage,
+				TemplateID:              &sampleTemplateID,
+				MaxInstances:            &sampleMaxInstances,
+				ProxmoxTaskWaitInterval: &sampleProxmoxTaskWaitInterval,
 			},
 			expectedError: nil,
 		},
