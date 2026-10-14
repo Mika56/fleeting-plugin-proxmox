@@ -2,7 +2,9 @@ package plugin
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
@@ -91,4 +93,42 @@ func TestRunParallel(t *testing.T) {
 	require.ErrorContains(t, panicked[2], "boom")
 	require.NoError(t, panicked[0])
 	require.NoError(t, panicked[1])
+}
+
+// A batch as large as the pool runs no more than maxParallelInstanceOperations operations at
+// once, and every slot still completes.
+func TestRunParallelCapsConcurrency(t *testing.T) {
+	t.Parallel()
+
+	const batch = maxParallelInstanceOperations * 2
+
+	var (
+		inFlight    atomic.Int64
+		maxInFlight atomic.Int64
+	)
+
+	errs := runParallel(batch, func(int) error {
+		current := inFlight.Add(1)
+
+		for {
+			previous := maxInFlight.Load()
+			if current <= previous || maxInFlight.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+
+		time.Sleep(time.Millisecond)
+
+		inFlight.Add(-1)
+
+		return nil
+	})
+
+	require.Len(t, errs, batch)
+
+	for index, attemptErr := range errs {
+		require.NoError(t, attemptErr, "slot %d", index)
+	}
+
+	require.LessOrEqual(t, maxInFlight.Load(), int64(maxParallelInstanceOperations))
 }

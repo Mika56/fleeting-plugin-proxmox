@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,23 @@ import (
 // instanceCloningMu and the collector queued behind it -- until the caller's
 // context expires.
 const proxmoxRequestTimeout = 30 * time.Second
+
+const (
+	// maxIdleConnsPerHost sizes the HTTP connection pool for the busiest moment: a batch
+	// runs up to maxParallelInstanceOperations operations at once, each holding a request,
+	// alongside the per-instance calls (connect info, heartbeat) the runners make. The
+	// default pool of two idle connections per host would close every connection beyond
+	// the first two and pay a TLS handshake for the rest.
+	maxIdleConnsPerHost = 64
+
+	// poolCacheTTL bounds how long the pool listing the per-instance lookups share stays
+	// trusted. Those lookups only need a member's node and listed name, and the per-
+	// instance name check re-verifies against the VM itself, so a listing a couple of
+	// seconds old is safe evidence; a fresh listing per call would multiply the pool
+	// endpoint by every connected instance. The removal and collection paths keep listing
+	// fresh: a rename must be visible the moment it happens.
+	poolCacheTTL = 2 * time.Second
+)
 
 var (
 	ErrNotFound = errors.New("not found")
@@ -59,6 +77,12 @@ func (ig *InstanceGroup) findPoolMember(ctx context.Context, vmid int) (proxmox.
 		return proxmox.ClusterResource{}, err
 	}
 
+	return findPoolMemberIn(pool, vmid)
+}
+
+// findPoolMemberIn is the listing-free half of findPoolMember: the member of an already
+// fetched pool that carries vmid, or ErrNotFound when none does.
+func findPoolMemberIn(pool *proxmox.Pool, vmid int) (proxmox.ClusterResource, error) {
 	for _, member := range pool.Members {
 		if member.Type != vmTypeQEMU {
 			continue
@@ -147,8 +171,108 @@ func (ig *InstanceGroup) nameFromNode(ctx context.Context, member *proxmox.Clust
 	return nil
 }
 
+// poolForOwnership returns the pool listing the per-instance lookups trust: a fresh one
+// when the cache is absent or older than poolCacheTTL. The fetch runs outside the guard,
+// so concurrent misses duplicate the listing rather than queueing behind it.
+func (ig *InstanceGroup) poolForOwnership(ctx context.Context) (*proxmox.Pool, error) {
+	ig.poolCacheMu.Lock()
+
+	if ig.poolCache != nil && time.Since(ig.poolCacheAt) < poolCacheTTL {
+		cached := ig.poolCache
+		ig.poolCacheMu.Unlock()
+
+		return cached, nil
+	}
+
+	ig.poolCacheMu.Unlock()
+
+	pool, err := ig.getProxmoxPool(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ig.poolCacheMu.Lock()
+	ig.poolCache = pool
+	ig.poolCacheAt = time.Now()
+	ig.poolCacheMu.Unlock()
+
+	return pool, nil
+}
+
+// resolveOwnedInstances lists the pool once and resolves each instance id to the VM it
+// names, the per-instance work running in parallel under the batch cap. Each id's error,
+// if any, is returned in its own slot; an id that resolves carries a non-nil VM in the
+// same slot.
+func (ig *InstanceGroup) resolveOwnedInstances(ctx context.Context, instances []string) ([]*proxmox.VirtualMachine, []error) {
+	if len(instances) == 0 {
+		return nil, nil
+	}
+
+	vms := make([]*proxmox.VirtualMachine, len(instances))
+
+	pool, err := ig.poolForOwnership(ctx)
+	if err != nil {
+		errs := make([]error, len(instances))
+
+		for index, instance := range instances {
+			_, parseErr := strconv.Atoi(instance)
+			if parseErr != nil {
+				errs[index] = fmt.Errorf("invalid vm id '%s': %w", instance, parseErr)
+
+				continue
+			}
+
+			errs[index] = err
+		}
+
+		return nil, errs
+	}
+
+	errs := runParallel(len(instances), func(index int) error {
+		vmid, parseErr := strconv.Atoi(instances[index])
+		if parseErr != nil {
+			return fmt.Errorf("invalid vm id '%s': %w", instances[index], parseErr)
+		}
+
+		member, memberErr := findPoolMemberIn(pool, vmid)
+		if memberErr != nil {
+			return fmt.Errorf("vm id '%d': %w", vmid, memberErr)
+		}
+
+		// An empty listed name is no evidence either way: Proxmox leaves it unset while it
+		// has no fresh status for the VM. The fetched name below decides.
+		if member.Name != "" && !ig.isOwnName(member.Name) {
+			return notOwned(member.VMID, member.Name)
+		}
+
+		vm, fetchErr := ig.getProxmoxVMOnNode(ctx, vmid, member.Node)
+		if fetchErr != nil {
+			return fetchErr
+		}
+
+		if name := fetchedName(vm); !ig.isOwnName(name) {
+			return notOwned(member.VMID, name)
+		}
+
+		vms[index] = vm
+
+		return nil
+	})
+
+	return vms, errs
+}
+
+// ownedInstance resolves a pool member to the VM it names, refusing a VM that does not
+// carry one of this group's instance names. The pool listing comes from the short-lived
+// ownership cache: a heartbeat or connect for one instance is one member of a fleet of
+// per-instance calls, and each one would otherwise re-list the whole pool.
 func (ig *InstanceGroup) ownedInstance(ctx context.Context, vmid int) (*proxmox.VirtualMachine, error) {
-	member, err := ig.findPoolMember(ctx, vmid)
+	pool, err := ig.poolForOwnership(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	member, err := findPoolMemberIn(pool, vmid)
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +392,7 @@ func (ig *InstanceGroup) getProxmoxClient() (*proxmox.Client, error) {
 	httpClient := http.Client{
 		Timeout: proxmoxRequestTimeout,
 		Transport: &http.Transport{
+			MaxIdleConnsPerHost: maxIdleConnsPerHost,
 			TLSClientConfig: &tls.Config{
 				//nolint:gosec
 				InsecureSkipVerify: ig.InsecureSkipTLSVerify,

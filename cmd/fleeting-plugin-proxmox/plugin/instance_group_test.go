@@ -876,6 +876,30 @@ func TestConnectInfo(t *testing.T) {
 		require.Regexp(t, `\[ERROR\].*failed to get network interface.*retry=0`, logBuf.String())
 	})
 
+	// Per-instance connects share the pool listing the way heartbeats do: the pool
+	// endpoint is paid once for the batch of connects, not once per instance.
+	t.Run("shares the pool listing across calls", func(t *testing.T) {
+		t.Parallel()
+
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{
+			members: []removalTestMember{
+				{vmid: 100, name: DefaultInstanceNameRunning},
+				{vmid: 101, name: DefaultInstanceNameRunning},
+			},
+			requests: counts,
+		})
+		ig.InstanceNetworkProtocol = NetworkProtocolIPv4
+
+		_, err := ig.ConnectInfo(context.Background(), "100")
+		require.NoError(t, err)
+
+		_, err = ig.ConnectInfo(context.Background(), "101")
+		require.NoError(t, err)
+
+		require.Equal(t, 1, counts.poolListings())
+	})
+
 	// A canceled ConnectInfo must not sit out the retry sleeps: it returns with the
 	// cancellation as soon as the current sleep is interrupted, not after the full retry
 	// budget.
@@ -939,6 +963,57 @@ func TestHeartbeat(t *testing.T) {
 		err := ig.Heartbeat(context.Background(), "100")
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to connect to qemu agent")
+	})
+}
+
+// The per-instance lookups share one pool listing inside the cache window: a fleet of
+// heartbeats and connects pays the pool endpoint once instead of once per instance. An
+// aged-out listing is re-fetched, and a re-Init discards a still-fresh one.
+func TestHeartbeatSharesPoolListing(t *testing.T) {
+	t.Parallel()
+
+	t.Run("heartbeats within the cache window share one listing", func(t *testing.T) {
+		t.Parallel()
+
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{
+			members: []removalTestMember{
+				{vmid: 100, name: DefaultInstanceNameRunning},
+				{vmid: 101, name: DefaultInstanceNameRunning},
+			},
+			requests: counts,
+		})
+
+		require.NoError(t, ig.Heartbeat(context.Background(), "100"))
+		require.NoError(t, ig.Heartbeat(context.Background(), "101"))
+		require.NoError(t, ig.Heartbeat(context.Background(), "100"))
+
+		require.Equal(t, 1, counts.poolListings())
+	})
+
+	t.Run("an aged or reset cache lists again", func(t *testing.T) {
+		t.Parallel()
+
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{
+			members:  []removalTestMember{{vmid: 100, name: DefaultInstanceNameRunning}},
+			requests: counts,
+		})
+
+		require.NoError(t, ig.Heartbeat(context.Background(), "100"))
+		require.Equal(t, 1, counts.poolListings())
+
+		// Age the cache past its TTL: the next heartbeat must list again.
+		ig.poolCacheAt = time.Now().Add(-2 * poolCacheTTL)
+
+		require.NoError(t, ig.Heartbeat(context.Background(), "100"))
+		require.Equal(t, 2, counts.poolListings())
+
+		// A re-Init discards the listing even though it is still fresh.
+		ig.resetLifecycle()
+
+		require.NoError(t, ig.Heartbeat(context.Background(), "100"))
+		require.Equal(t, 3, counts.poolListings())
 	})
 }
 
@@ -1020,6 +1095,27 @@ func TestResumeAndSuspend(t *testing.T) {
 				require.ErrorIs(t, err, operation.wantErr)
 				require.Contains(t, err.Error(), "api call failed for vm id '100'")
 				require.Empty(t, succeeded)
+			})
+
+			// A batch shares one pool listing: the per-instance work runs over a single
+			// shared listing, so the pool endpoint is paid once, not once per instance.
+			t.Run("batch shares one pool listing", func(t *testing.T) {
+				t.Parallel()
+
+				counts := &removalRequestCounts{}
+				ig := newRemovalTestGroup(t, removalTestServer{
+					members: []removalTestMember{
+						{vmid: 100, name: DefaultInstanceNameRunning},
+						{vmid: 101, name: DefaultInstanceNameRunning},
+						{vmid: 102, name: DefaultInstanceNameRunning},
+					},
+					requests: counts,
+				})
+
+				succeeded, err := operation.call(ig, []string{"100", "101", "102"})
+				require.NoError(t, err)
+				require.Equal(t, []string{"100", "101", "102"}, succeeded)
+				require.Equal(t, 1, counts.poolListings(), "a batch must list the pool once")
 			})
 		})
 	}
