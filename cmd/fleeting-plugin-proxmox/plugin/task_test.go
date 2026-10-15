@@ -174,6 +174,54 @@ func TestInstanceGroup_waitTaskTimesOutOnRunningTask(t *testing.T) {
 	require.Contains(t, err.Error(), "failed while waiting for task")
 }
 
+// A context cancelled between polls is observed when it is cancelled, not at the next poll:
+// proxmox.Task.Wait's sleep is not interruptible, so with the group's one-second test
+// interval a 150 ms cancellation could not be seen for nearly a full second.
+func TestInstanceGroup_waitTaskCancellationFiresBetweenPolls(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(taskHandler(t, "qmclone", "running", "", ""))
+	defer server.Close()
+
+	task := proxmox.NewTask(testTaskUPID(), proxmox.NewClient(server.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+
+	err := newWaitTestGroup().waitTask(ctx, task, time.Minute)
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Less(t, elapsed, 750*time.Millisecond, "the cancellation was noticed only at the next poll")
+}
+
+// The wait timeout fires when it elapses, not at the next poll: proxmox.Task.Wait checks
+// it only once per interval, so a 200 ms timeout on a one-second interval could not fire
+// until a full second in.
+func TestInstanceGroup_waitTaskTimeoutFiresBetweenPolls(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(taskHandler(t, "qmclone", "running", "", ""))
+	defer server.Close()
+
+	task := proxmox.NewTask(testTaskUPID(), proxmox.NewClient(server.URL))
+
+	start := time.Now()
+
+	err := newWaitTestGroup().waitTask(context.Background(), task, 200*time.Millisecond)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed while waiting for task")
+	require.Less(t, elapsed, 750*time.Millisecond, "the timeout was noticed only at the next poll")
+}
+
 // A poll whose response carries no status field is never trusted as success, and a task that
 // was never observed as stopped has no log to fetch.
 func TestInstanceGroup_waitTaskBlankStatusDoesNotFetchLog(t *testing.T) {
