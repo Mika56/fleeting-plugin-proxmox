@@ -37,7 +37,7 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, "fleeting-running", settings.InstanceNameRunning)
 	require.Equal(t, "fleeting-removing", settings.InstanceNameRemoving)
 	require.Equal(t, "ipv4", settings.InstanceNetworkProtocol)
-	require.Equal(t, 10, *settings.ProxmoxTaskWaitInterval)
+	require.Equal(t, 2, *settings.ProxmoxTaskWaitInterval)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,

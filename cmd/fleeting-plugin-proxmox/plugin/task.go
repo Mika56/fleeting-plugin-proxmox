@@ -67,7 +67,7 @@ func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task, timeo
 
 	interval := time.Duration(*ig.ProxmoxTaskWaitInterval) * time.Second
 
-	err := task.Wait(ctx, interval, timeout)
+	err := waitTaskStopped(ctx, task, interval, timeout)
 	if err != nil {
 		return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, err)
 	}
@@ -87,6 +87,46 @@ func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task, timeo
 	}
 
 	return fmt.Errorf("task '%s': %w", task.UPID, err)
+}
+
+// waitTaskStopped polls the task's status until it is no longer reported as running. It is
+// the plugin's own loop rather than proxmox.Task.Wait because Wait sleeps for a whole
+// interval between checks, so a cancelled context or an elapsed timeout is noticed only at
+// the next poll -- up to a full interval. Here the context, the timeout, and the poll tick
+// are three channels in one select, so each is observed the moment it fires.
+func waitTaskStopped(ctx context.Context, task *proxmox.Task, interval, timeout time.Duration) error {
+	// The first ping populates the status fields the outcome classification reads.
+	err := task.Ping(ctx)
+	if err != nil {
+		return fmt.Errorf("task poll failed: %w", err)
+	}
+
+	if task.Status != proxmox.TaskRunning {
+		return nil
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	deadline := time.After(timeout)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("cancelled while waiting for the task: %w", ctx.Err())
+		case <-deadline:
+			return fmt.Errorf("the task wait timed out: %w", proxmox.ErrTimeout)
+		case <-ticker.C:
+			err := task.Ping(ctx)
+			if err != nil {
+				return fmt.Errorf("task poll failed: %w", err)
+			}
+
+			if task.Status != proxmox.TaskRunning {
+				return nil
+			}
+		}
+	}
 }
 
 // taskLog returns the first page of a task's log in order. task.ExitStatus already carries

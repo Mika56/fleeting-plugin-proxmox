@@ -35,7 +35,7 @@ const (
 	DefaultInstanceNameRunning  = "fleeting-running"
 	DefaultInstanceNameRemoving = "fleeting-removing"
 
-	DefaultProxmoxTaskWaitInterval int = 10
+	DefaultProxmoxTaskWaitInterval int = 2
 )
 
 // Disk index limits for each disk type.
