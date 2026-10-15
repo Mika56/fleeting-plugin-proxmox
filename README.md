@@ -86,6 +86,10 @@ After creating a **DEDICATED** user, pool and, storage follow procedure below to
 5. Add following role for the user to the node with the storage, network, template etc.:
     * `PVEAuditor` without propagation.
 
+If using an API Token with privilege separation enabled, ensure these privileges are set
+as API token permissions. If privilege separation is not enabled on the token, they can
+be set as either token or user permissions.
+
 ### Running multiple managers on one host
 
 Give every runner manager its own user, pool, template, and unique `instance_name_creating`,
