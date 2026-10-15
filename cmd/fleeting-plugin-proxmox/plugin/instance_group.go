@@ -311,13 +311,22 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 
 // Update implements provider.InstanceGroup.
 func (ig *InstanceGroup) Update(ctx context.Context, update func(instance string, state provider.State)) error {
+	// List the pool under the cloning mutex: while a clone is in flight, a recycled VMID is
+	// reported with its predecessor's stale name, and classifying such a member would report a
+	// just-created VM under the old one's state. The mutex is dropped before the callback
+	// runs: it can round-trip to the provisioner per instance, and holding the mutex through
+	// it would stall Increase, Decrease and the collector for as long as the reconcile takes
+	// -- the same split as the collector and Decrease.
 	ig.instanceCloningMu.Lock()
-	defer ig.instanceCloningMu.Unlock()
 
 	pool, err := ig.getProxmoxPool(ctx)
 	if err != nil {
+		ig.instanceCloningMu.Unlock()
+
 		return err
 	}
+
+	ig.instanceCloningMu.Unlock()
 
 	for _, member := range pool.Members {
 		if !ig.isProxmoxResourceAnInstance(member) {

@@ -941,6 +941,120 @@ func TestUpdatePoolFetchFailure(t *testing.T) {
 	require.Contains(t, err.Error(), "failed to get pool")
 }
 
+// The pool listing must wait for the cloning mutex: while a clone is in flight, a recycled
+// VMID is reported with its predecessor's stale name, and a snapshot taken in that window
+// would let Update report a just-created VM under the old one's state.
+func TestUpdateListsPoolUnderCloningMutex(t *testing.T) {
+	t.Parallel()
+
+	counts := &removalRequestCounts{}
+	ig := newRemovalTestGroup(t, removalTestServer{
+		members:  []removalTestMember{{vmid: 100, name: DefaultInstanceNameRunning}},
+		requests: counts,
+	})
+
+	// Hold the cloning mutex as an in-flight Increase would.
+	ig.instanceCloningMu.Lock()
+
+	type updateResult struct {
+		reported int
+		err      error
+	}
+
+	result := make(chan updateResult, 1)
+
+	go func() {
+		reported := 0
+
+		err := ig.Update(context.Background(), func(string, provider.State) { reported++ })
+		result <- updateResult{reported: reported, err: err}
+	}()
+
+	// The pool listing must wait for the mutex. Poll the request log briefly rather than
+	// trusting a fixed sleep: the moment a listing is served while the mutex is held, the
+	// window the mutex exists to close has been read.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if counts.poolRequested() {
+			t.Fatal("Update listed the pool while a clone was in flight")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ig.instanceCloningMu.Unlock()
+
+	select {
+	case res := <-result:
+		require.NoError(t, res.err)
+		require.Equal(t, 1, res.reported, "the member was not reported after the clone finished")
+	case <-time.After(time.Second):
+		t.Fatal("Update did not return after the cloning mutex was released")
+	}
+}
+
+// While Update runs its per-instance callback, the cloning mutex must be free: the mutex
+// guards the pool listing against an in-flight clone POST, not the callback, which can
+// round-trip to the provisioner. Holding it through the callback would stall Increase,
+// Decrease and the collector for the whole reconcile.
+func TestUpdateReleasesCloningMutexBeforeCallback(t *testing.T) {
+	t.Parallel()
+
+	ig := newRemovalTestGroup(t, removalTestServer{
+		members: []removalTestMember{
+			{vmid: 100, name: DefaultInstanceNameCreating},
+			{vmid: 101, name: DefaultInstanceNameRunning},
+		},
+	})
+
+	inCallback := make(chan struct{})
+	release := make(chan struct{})
+
+	type updateResult struct {
+		reported int
+		err      error
+	}
+
+	result := make(chan updateResult, 1)
+
+	go func() {
+		reported := 0
+
+		err := ig.Update(context.Background(), func(string, provider.State) {
+			reported++
+
+			if reported == 1 {
+				close(inCallback)
+				<-release
+			}
+		})
+		result <- updateResult{reported: reported, err: err}
+	}()
+
+	// By the time the first callback is in flight the listing is long done, so a mutex
+	// still held there is one held for the callback.
+	select {
+	case <-inCallback:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Update never reached the per-instance callback")
+	}
+
+	if !ig.instanceCloningMu.TryLock() {
+		t.Fatal("the cloning mutex is still held while Update's callback is in flight")
+	}
+
+	ig.instanceCloningMu.Unlock()
+	close(release)
+
+	select {
+	case res := <-result:
+		require.NoError(t, res.err)
+		require.Equal(t, 2, res.reported)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Update did not return after the callback was released")
+	}
+}
+
 func TestConnectInfo(t *testing.T) {
 	t.Parallel()
 
