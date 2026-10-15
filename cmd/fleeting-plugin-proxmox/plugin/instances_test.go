@@ -144,6 +144,12 @@ type removalTestServer struct {
 	networkIfaceBodies []string
 
 	networkIfaceCalls *atomic.Int64
+
+	// stopStatusBlock, when non-nil, makes the qmstop task's /status route block until the
+	// channel closes, so a test can hold a round's stops in flight and count them; the
+	// in-flight count is reported through stopStatusConcurrency.
+	stopStatusBlock       <-chan struct{}
+	stopStatusConcurrency *atomic.Int64
 }
 
 // removalTestMember is one VM in the fake's pool. It appears in the pool listing and, under its
@@ -283,7 +289,7 @@ func newLogBuffer(t *testing.T) (hclog.Logger, *bytes.Buffer) {
 // removalTestTaskStatus answers a task's /status route by the task type in its UPID: a stop
 // or delete the member flags as failing reports that failure, everything else succeeds, and
 // an unrecognised UPID is answered as the (failing) rename task.
-func removalTestTaskStatus(t *testing.T, memberByVMID map[string]removalTestMember) http.HandlerFunc {
+func removalTestTaskStatus(t *testing.T, opts removalTestServer, memberByVMID map[string]removalTestMember) http.HandlerFunc {
 	t.Helper()
 
 	renameTask := taskHandler(t, "qmconfig", taskStatusStopped, "VM is locked (clone)", "TASK ERROR: VM is locked (clone)")
@@ -297,6 +303,12 @@ func removalTestTaskStatus(t *testing.T, memberByVMID map[string]removalTestMemb
 		case strings.Contains(request.URL.Path, ":qmstop:"):
 			if member, ok := memberByVMID[upidVMID(request.URL.Path)]; ok && member.stopFails {
 				fmt.Fprint(writer, taskStatusBody("qmstop", taskStatusStopped, "TASK ERROR: VM is locked (clone)"))
+			} else if opts.stopStatusBlock != nil {
+				opts.stopStatusConcurrency.Add(1)
+				<-opts.stopStatusBlock
+				opts.stopStatusConcurrency.Add(-1)
+
+				stopTask(writer, request)
 			} else {
 				stopTask(writer, request)
 			}
@@ -432,7 +444,7 @@ func removalTestHandler(t *testing.T, opts removalTestServer, counts *removalReq
 	t.Helper()
 
 	renameTask := taskHandler(t, "qmconfig", taskStatusStopped, "VM is locked (clone)", "TASK ERROR: VM is locked (clone)")
-	taskStatus := removalTestTaskStatus(t, memberByVMID)
+	taskStatus := removalTestTaskStatus(t, opts, memberByVMID)
 
 	configResponse := opts.configResponse
 	if configResponse == "" {
@@ -516,6 +528,10 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 
 	if opts.networkIfaceCalls == nil {
 		opts.networkIfaceCalls = &atomic.Int64{}
+	}
+
+	if opts.stopStatusConcurrency == nil {
+		opts.stopStatusConcurrency = &atomic.Int64{}
 	}
 
 	members := opts.members

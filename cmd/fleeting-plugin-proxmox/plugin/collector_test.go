@@ -146,6 +146,87 @@ func TestCollectRemovedInstances(t *testing.T) {
 	require.Empty(t, counts.requestsFor(103), "a non-VM pool member was touched")
 }
 
+// A collection round can name as many members as the pool holds: its per-instance work must
+// run under the same batch cap as every other batch, not one goroutine per member.
+func TestCollectRemovedInstancesCapsConcurrency(t *testing.T) {
+	t.Parallel()
+
+	members := make([]removalTestMember, 0, 2*maxParallelInstanceOperations)
+
+	for vmid := range 2 * maxParallelInstanceOperations {
+		members = append(members, removalTestMember{
+			vmid: uint64(100 + vmid),
+			name: DefaultInstanceNameRemoving,
+		})
+	}
+
+	block := make(chan struct{})
+	inFlight := &atomic.Int64{}
+	counts := &removalRequestCounts{}
+
+	ig := newRemovalTestGroup(t, removalTestServer{
+		members:               members,
+		requests:              counts,
+		stopStatusBlock:       block,
+		stopStatusConcurrency: inFlight,
+	})
+
+	// The sampler tracks the peak in-flight stop count; the stops stay held until the test
+	// releases them, so the peak is visible for at least one tick.
+	var maxInFlight atomic.Int64
+
+	stopSampling := make(chan struct{})
+	sampled := make(chan struct{})
+
+	go func() {
+		defer close(sampled)
+
+		for {
+			if current := inFlight.Load(); current > maxInFlight.Load() {
+				maxInFlight.Store(current)
+			}
+
+			select {
+			case <-stopSampling:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+
+	go func() {
+		ig.collectRemovedInstances()
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		return maxInFlight.Load() == int64(maxParallelInstanceOperations)
+	}, 10*time.Second, 5*time.Millisecond,
+		"the round never had a full batch of %d stops in flight", maxParallelInstanceOperations)
+
+	close(block)
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the round did not finish after the stops were released")
+	}
+
+	close(stopSampling)
+	<-sampled
+
+	require.Equal(t, int64(maxParallelInstanceOperations), maxInFlight.Load(), "more than the batch cap ran at once")
+
+	for _, member := range members {
+		id := member.vmid
+
+		require.True(t, counts.requested(id, http.MethodPost, "/status/stop"), "vm %d was not stopped: %v", id, counts.requestsFor(id))
+		require.True(t, counts.requested(id, http.MethodDelete, ""), "vm %d was not deleted: %v", id, counts.requestsFor(id))
+	}
+}
+
 func TestCollectRemovedInstancesPoolFetchFailure(t *testing.T) {
 	t.Parallel()
 
