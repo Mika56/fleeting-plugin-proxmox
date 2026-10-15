@@ -12127,7 +12127,7 @@ github.com/oklog/run/LICENSE:
 	See the License for the specific language governing permissions and
 	limitations under the License.
 
-github.com/phenix66/fleeting-plugin-proxmox/LICENSE:
+github.com/phenix66/fleeting-plugin-proxmox/v2/LICENSE:
 
 	MIT License
 	

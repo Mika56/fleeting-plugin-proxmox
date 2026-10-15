@@ -1,4 +1,4 @@
-module github.com/phenix66/fleeting-plugin-proxmox
+module github.com/phenix66/fleeting-plugin-proxmox/v2
 
 go 1.27.1
 
