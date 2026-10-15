@@ -3,7 +3,6 @@ package plugin
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/luthermonson/go-proxmox"
@@ -71,8 +70,7 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 		return
 	}
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
+	members := make([]proxmox.ClusterResource, 0, len(pool.Members))
 
 	for _, member := range pool.Members {
 		if !ig.isProxmoxResourceAnInstance(member) {
@@ -85,14 +83,18 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 
 		ig.log.Info("collector found instance to remove", "vmid", member.VMID, "name", member.Name)
 
-		wg.Add(1)
-
-		go func(member proxmox.ClusterResource) {
-			defer wg.Done()
-
-			ig.collectInstance(ctx, member)
-		}(member)
+		members = append(members, member)
 	}
+
+	// The per-instance work runs under the same batch cap as every other batch: a round can
+	// name as many members as the pool holds, and unbounded fan-out would open one HTTP
+	// connection and one task poller per member whatever the pool's size. collectInstance
+	// logs each member's own failure, so the batch's slots stay nil.
+	runParallel(len(members), func(index int) error {
+		ig.collectInstance(ctx, members[index])
+
+		return nil
+	})
 }
 
 // lockWait caps how long a collection round waits for the cloning lock before skipping the
