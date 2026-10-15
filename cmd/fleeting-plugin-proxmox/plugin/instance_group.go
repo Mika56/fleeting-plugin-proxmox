@@ -91,6 +91,11 @@ type InstanceGroup struct {
 
 	// Guards the channel closes; re-armed by resetLifecycle.
 	shutdownOnce sync.Once `json:"-"`
+
+	// storageFullLogMu guards storageFullLoggedAt, which throttles the warning logged when
+	// Increase clones fewer instances than requested for lack of storage space.
+	storageFullLogMu    sync.Mutex `json:"-"`
+	storageFullLoggedAt time.Time  `json:"-"`
 }
 
 // Init implements provider.InstanceGroup.
@@ -254,6 +259,20 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	template, err := ig.getProxmoxVM(ctx, *ig.TemplateID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to find template with id='%d': %w", *ig.TemplateID, err)
+	}
+
+	// Clone only what fits on the storage. A clone or resize that runs out of space fails
+	// anyway, but only after Proxmox has started on it; refusing up front keeps the demand
+	// pending in taskscaler, which retries it once instances are removed and space frees up.
+	if ig.StorageReserve != "" {
+		count, err = ig.instancesThatFit(ctx, template, count)
+		if err != nil {
+			return 0, fmt.Errorf("failed to check free space on storage='%s': %w", ig.Storage, err)
+		}
+
+		if count == 0 {
+			return 0, nil
+		}
 	}
 
 	// We need to mutex cloning as Proxmox will fail multiple requests in parallel

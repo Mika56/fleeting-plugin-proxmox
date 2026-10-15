@@ -106,6 +106,10 @@ type Settings struct {
 	// If unset, instances are cloned onto the node hosting the template.
 	InstanceTargetNode string `json:"instance_target_node"`
 
+	// Free space to keep on the storage after every clone. When set, Increase only clones as
+	// many instances as fit on the storage. Accepts the same units as instance_autoresize_size.
+	StorageReserve string `json:"storage_reserve"`
+
 	// How often should task status be queried
 	ProxmoxTaskWaitInterval *int `json:"proxmox_task_wait_interval"`
 }
@@ -148,6 +152,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"instance_autoresize_disk", s.validateInstanceAutoresizeDisk},
 		{"instance_autoresize_size", s.validateInstanceAutoresizeSize},
 		{"instance_autoresize_consistency", s.validateInstanceAutoresizeConsistency},
+		{"storage_reserve", s.validateStorageReserve},
 		{"proxmox_task_wait_interval", s.validateProxmoxTaskWaitInterval},
 	}
 
@@ -289,6 +294,26 @@ func (s *Settings) validateInstanceAutoresizeConsistency() error {
 
 	if s.InstanceAutoresizeDisk == "" && s.InstanceAutoresizeSize != "" {
 		return fmt.Errorf("%w: instance_autoresize_disk must have a value when instance_autoresize_size is set", ErrSettingInvalidParameter)
+	}
+
+	return nil
+}
+
+// validateStorageReserve checks that the reserve is an absolute size, and that there is a
+// storage to check it against: without one, clones are linked and land on the template's
+// storage, which the plugin does not know.
+func (s *Settings) validateStorageReserve() error {
+	if s.StorageReserve == "" {
+		return nil
+	}
+
+	_, err := parseProxmoxSize(s.StorageReserve)
+	if err != nil {
+		return fmt.Errorf("%w: storage_reserve: must be a valid absolute size (e.g.: 5G or 512M)", ErrSettingInvalidParameter)
+	}
+
+	if s.Storage == "" {
+		return fmt.Errorf("%w: storage must have a value when storage_reserve is set", ErrSettingInvalidParameter)
 	}
 
 	return nil
