@@ -10,9 +10,11 @@ import (
 )
 
 const (
-	collectionInterval         = 1 * time.Minute
-	collectionTimeout          = 5 * time.Minute
-	collectionWaitAfterTrigger = 10 * time.Second
+	collectionInterval           = 1 * time.Minute
+	collectionTimeout            = 5 * time.Minute
+	collectionLockPoll           = 500 * time.Millisecond
+	defaultCollectionLockWait    = 10 * time.Second
+	defaultCollectionTriggerWait = 10 * time.Second
 )
 
 func (ig *InstanceGroup) startRemovedInstanceCollector() {
@@ -33,7 +35,7 @@ func (ig *InstanceGroup) runRemovedInstanceCollector() {
 				ig.collectRemovedInstances()
 			case <-ig.instanceCollectionTrigger:
 				// Sleep for a bit to give Proxmox a chance to propagate renames that happened before trigger
-				<-time.After(collectionWaitAfterTrigger)
+				<-time.After(ig.triggerWait())
 
 				ig.collectRemovedInstances()
 			}
@@ -45,17 +47,29 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 	ctx, cancel := context.WithTimeout(context.Background(), collectionTimeout)
 	defer cancel()
 
-	ig.instanceCloningMu.Lock()
+	// The listing must not race a clone: while one is in flight, a recycled VMID is reported
+	// with its predecessor's stale name, and collecting from such a listing could stop or
+	// delete a just-created instance. A held lock means the listing would be stale by
+	// definition, so the round is skipped and its wake-up re-queued for the next attempt
+	// instead of waiting the clone out.
+	unlock, ok := ig.lockInstanceCloning(ctx)
+	if !ok {
+		ig.log.Info("collector skipping round: an instance clone is in progress")
 
-	pool, err := ig.getProxmoxPool(ctx)
-	if err != nil {
-		ig.log.Error("collector failed to list instances", "err", err)
-		ig.instanceCloningMu.Unlock()
+		ig.triggerCollection()
 
 		return
 	}
 
-	ig.instanceCloningMu.Unlock()
+	pool, err := ig.getProxmoxPool(ctx)
+
+	unlock()
+
+	if err != nil {
+		ig.log.Error("collector failed to list instances", "err", err)
+
+		return
+	}
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -78,6 +92,64 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 
 			ig.collectInstance(ctx, member)
 		}(member)
+	}
+}
+
+// lockWait caps how long a collection round waits for the cloning lock before skipping the
+// round: a held lock means a clone is in flight, and the listing the lock guards is stale
+// for exactly as long as it is held, so waiting it out buys nothing -- the round is
+// re-queued and retried once the lock is free. A per-group override wins over the default
+// so a test can shorten it on its own group.
+func (ig *InstanceGroup) lockWait() time.Duration {
+	if ig.collectionLockWait > 0 {
+		return ig.collectionLockWait
+	}
+
+	return defaultCollectionLockWait
+}
+
+// triggerWait paces a triggered round so a rename has time to propagate before it
+// collects; a per-group override wins over the default for the same test reason.
+func (ig *InstanceGroup) triggerWait() time.Duration {
+	if ig.collectionTriggerWait > 0 {
+		return ig.collectionTriggerWait
+	}
+
+	return defaultCollectionTriggerWait
+}
+
+// lockInstanceCloning acquires the cloning lock for the duration of one pool listing, giving
+// up after the shorter of lockWait and the round's context deadline. A false second return
+// means a clone is in flight and the caller must skip its round: a listing taken under a
+// held lock is precisely the stale one the lock exists to prevent.
+func (ig *InstanceGroup) lockInstanceCloning(ctx context.Context) (func(), bool) {
+	waitFor := ig.lockWait()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < waitFor {
+			waitFor = remaining
+		}
+	}
+
+	deadline := time.Now().Add(waitFor)
+
+	for {
+		if ig.instanceCloningMu.TryLock() {
+			return ig.instanceCloningMu.Unlock, true
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, false
+		}
+
+		poll := min(collectionLockPoll, remaining)
+
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(poll):
+		}
 	}
 }
 
