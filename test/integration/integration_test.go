@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/phenix66/fleeting-plugin-proxmox/cmd/fleeting-plugin-proxmox/plugin"
+	"github.com/phenix66/fleeting-plugin-proxmox/v2/cmd/fleeting-plugin-proxmox/plugin"
 	"gitlab.com/gitlab-org/fleeting/fleeting/integration"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )

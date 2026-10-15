@@ -7,7 +7,7 @@ import (
 	"os"
 	"runtime/debug"
 
-	proxmox "github.com/phenix66/fleeting-plugin-proxmox/cmd/fleeting-plugin-proxmox/plugin"
+	proxmox "github.com/phenix66/fleeting-plugin-proxmox/v2/cmd/fleeting-plugin-proxmox/plugin"
 	"gitlab.com/gitlab-org/fleeting/fleeting/plugin"
 )
 
