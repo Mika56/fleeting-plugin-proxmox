@@ -40,9 +40,30 @@ The following image tags are available:
 | `instance_tags_creating`     | string                    | None (`""`)                             | Tags to set for instances during creation. Separate multiple tags with semicolons (`;`). Tags the instance already carries (from the template or applied manually) are preserved; only the tags configured here are added or removed as the instance changes state.                                                                                       |
 | `instance_tags_running`      | string                    | None (`""`)                             | Tags to set for running instances. Separate multiple tags with semicolons (`;`). Tags the instance already carries (from the template or applied manually) are preserved; only the tags configured here are added or removed as the instance changes state.                                                                                           |
 | `instance_tags_removing`     | string                    | None (`""`)                             | Tags to set for instances during removal. Separate multiple tags with semicolons (`;`). Tags the instance already carries (from the template or applied manually) are preserved; only the tags configured here are added or removed as the instance changes state.                                                                                          |
-| `instance_autoresize_disk`   | string                    | (None - disabled)                       | Name of disk to autoresize after cloning                                                                                                                                                                                                                                                                             |
+| `instance_autoresize_disk`   | string                    | (None - disabled)                       | Name of disk to autoresize after cloning. After the resize, the plugin reads the disk size back from the VM configuration; an instance whose disk did not reach the expected size is marked for removal and reported as failed.                                                                                    |
 | `instance_autoresize_size`   | string                    | (None - disabled)                       | Absolute or increment size to autoresize after cloning. Examples: 10G, +5.5G                                                                                                                                                                                                                                         |
+| `storage_reserve`            | string                    | (None - disabled)                       | Free space to keep on `storage` (required when set). When set, every `Increase` reads the storage's free space and clones only as many instances as fit while leaving this much free; the rest of the demand stays pending until space frees up. An instance counts as the size of all its template's disks, with `instance_autoresize_disk` at its resized size. Examples: 5G, 512M, 0. See [Storage capacity](#storage-capacity). |
 | `proxmox_task_wait_interval` | int                       | 10                                      | How often, in seconds, to check for Proxmox task completion. Must be greater than zero.                                                                                                                                                                                                                                                                       |
+
+### Storage capacity
+
+Without `storage_reserve`, the plugin clones as many instances as fleeting asks for, up to
+`max_instances`, and a clone or resize that runs out of space fails only once Proxmox has started
+on it. With `storage_reserve`, the free space reported by Proxmox for `storage` on the target node
+is checked before each batch of clones:
+
+- On thick storage (LVM, directory with raw images), free space is what clones really allocate,
+  so the check is exact for this manager.
+- On thin storage (LVM-thin, ZFS, qcow2), free space is the data actually written, not the size
+  promised to existing instances. The check then limits new clones but does not prevent
+  instances that are already running from filling the storage as they write.
+- Several managers cloning onto the same storage each check it on their own, so two of them
+  can both see the same free space. Set `storage_reserve` to at least one instance's worth per
+  other manager sharing the storage; a clone that still runs out of space fails as before and
+  its instance is cleaned up.
+
+The API user needs `Datastore.Audit` on the storage to read its status; `PVEDatastoreUser`
+includes it.
 
 ### Credentials file
 

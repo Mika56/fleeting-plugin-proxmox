@@ -26,6 +26,7 @@ const (
 	deployTestAutoresizeSize     = "10G"
 	deployTestAutoresizeDisk     = "scsi1"
 	deployTestTagsCreating       = "template-tag,fleeting-creating"
+	deployTestDiskSize           = "1G"
 )
 
 // deployTestOptions parameterises newDeployTestGroup.
@@ -45,6 +46,13 @@ type deployTestOptions struct {
 	configFailOnCall *int
 
 	configCalls *atomic.Int64
+
+	// resizeNotApplied makes the resize task succeed without the disk growing, the way a
+	// resize Proxmox answers without a task can leave it.
+	resizeNotApplied bool
+
+	// storageAvail is the free space, in bytes, the fake reports for the storage.
+	storageAvail uint64
 }
 
 // deployTestCounts records what a deploy asked the fake to do, so a test can assert on the
@@ -53,6 +61,14 @@ type deployTestCounts struct {
 	mu      sync.Mutex
 	configs []map[string]any
 	resizes []map[string]any
+	clones  int
+}
+
+func (c *deployTestCounts) cloneCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.clones
 }
 
 func (c *deployTestCounts) lastConfig() (map[string]any, bool) {
@@ -135,7 +151,23 @@ func newDeployTestGroup(t *testing.T, log hclog.Logger, opts deployTestOptions) 
 	mux.HandleFunc("GET "+vmRoute("status/current"),
 		constant(fmt.Sprintf(`{"data":{"vmid":%d,"name":"fleeting-creating","status":"running"}}`, deployTestCloneVMID)))
 
-	mux.HandleFunc("GET "+vmRoute("config"), constant(`{"data":{"tags":"template-tag"}}`))
+	// The template and its clone both carry the autoresize disk; the clone's grows when the
+	// fake applies a resize.
+	var (
+		diskSizeMu sync.Mutex
+		diskSize   = deployTestDiskSize
+	)
+
+	mux.HandleFunc("GET "+vmRoute("config"), func(writer http.ResponseWriter, _ *http.Request) {
+		diskSizeMu.Lock()
+		defer diskSizeMu.Unlock()
+
+		fmt.Fprintf(writer, `{"data":{"tags":"template-tag","ide2":"none,media=cdrom","%s":"local:vm-%d-disk-0,size=%s"}}`,
+			deployTestAutoresizeDisk, deployTestCloneVMID, diskSize)
+	})
+
+	mux.HandleFunc("GET /nodes/"+deployTestNode+"/storage/"+deployTestStorage+"/status",
+		constant(fmt.Sprintf(`{"data":{"storage":%q,"avail":%d,"total":%d}}`, deployTestStorage, opts.storageAvail, opts.storageAvail)))
 
 	mux.HandleFunc("POST "+vmRoute("config"), func(writer http.ResponseWriter, request *http.Request) {
 		call := int(opts.configCalls.Add(1)) - 1
@@ -159,9 +191,17 @@ func newDeployTestGroup(t *testing.T, log hclog.Logger, opts deployTestOptions) 
 			return
 		}
 
+		body := decodeBody(t, request)
+
 		counts.mu.Lock()
-		counts.resizes = append(counts.resizes, decodeBody(t, request))
+		counts.resizes = append(counts.resizes, body)
 		counts.mu.Unlock()
+
+		if !opts.resizeNotApplied {
+			diskSizeMu.Lock()
+			diskSize, _ = body["size"].(string)
+			diskSizeMu.Unlock()
+		}
 
 		fmt.Fprintf(writer, `{"data":%q}`, increaseTestUPID("qmresize", deployTestCloneVMID))
 	})
@@ -172,6 +212,10 @@ func newDeployTestGroup(t *testing.T, log hclog.Logger, opts deployTestOptions) 
 
 			return
 		}
+
+		counts.mu.Lock()
+		counts.clones++
+		counts.mu.Unlock()
 
 		fmt.Fprintf(writer, `{"data":%q}`, increaseTestUPID("qmclone", deployTestCloneVMID))
 	})
@@ -414,4 +458,63 @@ func TestDeployInstanceAutoresize(t *testing.T) {
 		vmOptName: DefaultInstanceNameRunning,
 		vmOptTags: "template-tag,fleeting-running",
 	}, configs[1])
+}
+
+// A resize whose task succeeds but leaves the disk at its old size must fail the deploy and
+// mark the instance for removal, never report an undersized instance as running.
+func TestDeployInstanceAutoresizeNotApplied(t *testing.T) {
+	t.Parallel()
+
+	log, _ := newLogBuffer(t)
+	ig, counts := newDeployTestGroup(t, log, deployTestOptions{autoresize: true, resizeNotApplied: true})
+
+	template := deployTestTemplate(t, ig)
+
+	vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+	require.ErrorIs(t, err, ErrAutoresizeNotApplied)
+	require.Contains(t, err.Error(), "marked for removal")
+	require.Equal(t, deployTestCloneVMID, vmid)
+
+	lastConfig, ok := counts.lastConfig()
+	require.True(t, ok, "the failed instance was never renamed")
+	require.Equal(t, DefaultInstanceNameRemoving, lastConfig[vmOptName])
+}
+
+// With storage_reserve set, Increase clones only the instances whose disks fit on the storage
+// next to the reserve, counting the autoresize disk at its resized size, and reports a demand
+// that does not fit at all as nothing created rather than as an error.
+func TestIncreaseClonesOnlyWhatFitsOnStorage(t *testing.T) {
+	t.Parallel()
+
+	const gib = 1 << 30
+
+	testCases := []struct {
+		name       string
+		avail      uint64
+		requested  int
+		wantClones int
+	}{
+		// Each instance takes 10G (scsi1 resized from 1G); the cdrom takes nothing.
+		{name: "nothing fits", avail: 14 * gib, requested: 1, wantClones: 0},
+		{name: "one fits", avail: 15 * gib, requested: 1, wantClones: 1},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			log, logBuffer := newLogBuffer(t)
+			ig, counts := newDeployTestGroup(t, log, deployTestOptions{autoresize: true, storageAvail: testCase.avail})
+			ig.StorageReserve = "5G"
+
+			succeeded, err := ig.Increase(context.Background(), testCase.requested)
+			require.NoError(t, err)
+			require.Equal(t, testCase.wantClones, succeeded)
+			require.Equal(t, testCase.wantClones, counts.cloneCount())
+
+			if testCase.wantClones < testCase.requested {
+				require.Regexp(t, `\[WARN\].*not enough free space on storage`, logBuffer.String())
+			}
+		})
+	}
 }
