@@ -61,6 +61,15 @@ type InstanceGroup struct {
 	// Trigger for collector to start removed instances collection.
 	instanceCollectionTrigger chan struct{} `json:"-"`
 
+	// collectionLockWait caps how long a collection round waits for the cloning lock before
+	// skipping the round; zero means defaultCollectionLockWait. Per-instance so a test can
+	// shorten it on its own group without touching shared state.
+	collectionLockWait time.Duration `json:"-"`
+
+	// collectionTriggerWait paces a triggered round so a rename has time to propagate; zero
+	// means defaultCollectionTriggerWait. Per-instance for the same test reason.
+	collectionTriggerWait time.Duration `json:"-"`
+
 	// Trigger to shutdown collector.
 	collectorShutdownTrigger chan struct{} `json:"-"`
 
@@ -113,7 +122,7 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 
 	// Sleep for a bit to give Proxmox a chance to propagate renames for stale instances
 	// Without this sleep these instances would be reported as creating during first Update
-	<-time.After(collectionWaitAfterTrigger)
+	<-time.After(ig.triggerWait())
 
 	//nolint:contextcheck
 	ig.startRemovedInstanceCollector()

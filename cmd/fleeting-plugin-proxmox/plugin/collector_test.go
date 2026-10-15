@@ -163,6 +163,102 @@ func TestCollectRemovedInstancesPoolFetchFailure(t *testing.T) {
 	require.Empty(t, counts.requestsFor(100), "a pool fetch failure must not reach the members")
 }
 
+// While the cloning lock is held -- an in-flight Increase -- a collection round must not
+// wait it out: it skips without listing the pool or touching any member, re-queues its
+// wake-up, and returns, so a Shutdown waiting on the collector cannot be held hostage by
+// the clone.
+func TestCollectRoundSkipsWhileCloning(t *testing.T) {
+	t.Parallel()
+
+	log, logBuf := newLogBuffer(t)
+	counts := &removalRequestCounts{}
+	ig := newRemovalTestGroup(t, removalTestServer{
+		log:      log,
+		members:  []removalTestMember{{vmid: 100, name: DefaultInstanceNameRemoving}},
+		requests: counts,
+	})
+
+	// Shorten the skip bound on this group only, so the test does not wait a real skip.
+	ig.collectionLockWait = 100 * time.Millisecond
+
+	ig.instanceCloningMu.Lock()
+	t.Cleanup(ig.instanceCloningMu.Unlock)
+
+	done := make(chan struct{})
+
+	go func() {
+		ig.collectRemovedInstances()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the collection round did not skip a held cloning lock")
+	}
+
+	require.Zero(t, counts.poolListings(), "a skipped round must not list the pool")
+	require.Empty(t, counts.requestsFor(100), "a skipped round must not reach the members")
+	require.Contains(t, logBuf.String(), "skipping round")
+	require.Len(t, ig.instanceCollectionTrigger, 1, "a skipped round must re-queue its wake-up")
+}
+
+// A clone that releases the lock before the skip bound lets the round proceed: the round
+// waits for the lock, then lists and collects as usual. The skip is for in-flight clones,
+// not for every lock hold.
+func TestCollectRoundWaitsOutBriefCloneHold(t *testing.T) {
+	t.Parallel()
+
+	counts := &removalRequestCounts{}
+	ig := newRemovalTestGroup(t, removalTestServer{
+		members:  []removalTestMember{{vmid: 100, name: DefaultInstanceNameRemoving}},
+		requests: counts,
+	})
+
+	ig.instanceCloningMu.Lock()
+	time.Sleep(2 * collectionLockPoll)
+	ig.instanceCloningMu.Unlock()
+
+	ig.collectRemovedInstances()
+
+	require.True(t, counts.requested(100, http.MethodPost, "/status/stop"), "the marked instance was not stopped: %v", counts.requestsFor(100))
+	require.True(t, counts.requested(100, http.MethodDelete, ""), "the marked instance was not deleted: %v", counts.requestsFor(100))
+}
+
+// A Shutdown racing an in-flight Increase -- the collector blocked on the cloning lock the
+// Increase holds -- must return once the round gives up the lock wait, not wait for the
+// clone to finish.
+func TestShutdownReturnsWhileCloneHoldsLock(t *testing.T) {
+	t.Parallel()
+
+	ig := newRemovalTestGroup(t, removalTestServer{})
+	ig.resetLifecycle()
+
+	// Shorten both bounds on this group only so the test cycles fast instead of waiting
+	// real skips.
+	ig.collectionLockWait = 100 * time.Millisecond
+	ig.collectionTriggerWait = 50 * time.Millisecond
+
+	ig.startRemovedInstanceCollector()
+
+	// Hold the cloning lock as an in-flight Increase would, and wake the collector so its
+	// round hits the held lock.
+	ig.instanceCloningMu.Lock()
+	t.Cleanup(ig.instanceCloningMu.Unlock)
+
+	ig.triggerCollection()
+
+	// Let the collector reach the lock wait: trigger sleep, then the round's bounded wait.
+	time.Sleep(400 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := ig.Shutdown(ctx)
+
+	require.NoError(t, err, "Shutdown must return while a clone holds the cloning lock")
+}
+
 // fetchToCollect logs a failed fetch that is not an ownership refusal, so a VM that cannot
 // be read is not dropped silently.
 func TestFetchToCollectLogsFailedFetch(t *testing.T) {
