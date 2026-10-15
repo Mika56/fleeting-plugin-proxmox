@@ -878,7 +878,7 @@ func TestCloneTemplateReportsCloneOptionsError(t *testing.T) {
 
 	template := &proxmox.VirtualMachine{}
 
-	vmid, task, err := ig.cloneTemplate(context.Background(), template, new(sync.Mutex))
+	vmid, task, err := ig.cloneTemplate(context.Background(), template)
 	require.ErrorIs(t, err, ErrCloneVMWithoutConfiguredStorage)
 	require.Equal(t, -1, vmid)
 	require.Nil(t, task)

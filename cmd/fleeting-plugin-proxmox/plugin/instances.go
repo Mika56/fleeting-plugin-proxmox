@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -25,8 +24,8 @@ const (
 
 var ErrCloneVMWithoutConfiguredStorage = errors.New("attempted to clone a VM without configured storage")
 
-func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.VirtualMachine, cloneMu *sync.Mutex) (int, error) {
-	VMID, task, err := ig.cloneTemplate(ctx, template, cloneMu)
+func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.VirtualMachine) (int, error) {
+	VMID, task, err := ig.cloneTemplate(ctx, template)
 	if err == nil {
 		ig.log.Info("Deploying new instance", "vmid", VMID)
 
@@ -116,14 +115,21 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 	return VMID, nil
 }
 
-func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.VirtualMachine, cloneMu *sync.Mutex) (int, *proxmox.Task, error) {
+// cloneTemplate clones the template while holding the cloning lock for the duration of the
+// clone call only. The lock serialises clones across every Increase: Proxmox refuses
+// parallel clone requests against the same template, and the vendor pairs the next-VMID
+// fetch with the clone POST in one call, so that pair must be atomic across calls, not just
+// within one batch. It is released before the caller waits on the clone task: the wait is
+// minutes long, and holding the lock through it would stall Update, Decrease and the
+// collector for the whole deployment.
+func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.VirtualMachine) (int, *proxmox.Task, error) {
 	cloneOptions, err := ig.getTemplateCloneOptions(template)
 	if err != nil {
 		return -1, nil, err
 	}
 
-	cloneMu.Lock()
-	defer cloneMu.Unlock()
+	ig.instanceCloningMu.Lock()
+	defer ig.instanceCloningMu.Unlock()
 
 	VMID, task, err := template.Clone(ctx, cloneOptions)
 	if err != nil {

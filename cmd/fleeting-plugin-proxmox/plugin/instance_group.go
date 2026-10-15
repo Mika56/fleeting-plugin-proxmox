@@ -53,9 +53,15 @@ type InstanceGroup struct {
 	// and the session ticket refresher is not started.
 	usingTokenAuth bool `json:"-"`
 
-	// This mutex is used when cloning template for new instances. It is required for blocking other
-	// operations like collection, update or decrease, because when new instance is created with recycled ID then for
-	// a brief period it will be reported from Proxmox with old name (e.g. InstanceNameRemoving).
+	// Held for the duration of one template.Clone call. It serialises clones across every
+	// Increase: Proxmox refuses parallel clone requests against the same template, and the
+	// vendor pairs the next-VMID fetch with the clone POST in one call, so that pair must be
+	// atomic across calls. Collection, Update and Decrease take their pool listings under it:
+	// while a clone is in flight, a recycled VMID is reported with its predecessor's stale
+	// name (e.g. InstanceNameRemoving), and a listing taken in that window would classify a
+	// just-created VM from the old one's name. Deliberately NOT held for the clone's task
+	// wait or anything after it: that is minutes long, and holding it would stall the
+	// provisioner's Update and Decrease for the whole deployment.
 	instanceCloningMu sync.Mutex `json:"-"`
 
 	// Trigger for collector to start removed instances collection.
@@ -255,6 +261,10 @@ func panicError(recovered any) error {
 }
 
 // Increase implements provider.InstanceGroup.
+// Increase implements provider.InstanceGroup. The cloning lock is held only for each
+// individual clone call, inside cloneTemplate, so Update, Decrease and the collector are
+// blocked for the duration of a clone POST -- not for the whole batch's task waits and agent
+// polls, which can run for minutes per instance.
 func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	template, err := ig.getProxmoxVM(ctx, *ig.TemplateID)
 	if err != nil {
@@ -275,16 +285,10 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 		}
 	}
 
-	// We need to mutex cloning as Proxmox will fail multiple requests in parallel
-	cloneMu := new(sync.Mutex)
-
-	ig.instanceCloningMu.Lock()
-	defer ig.instanceCloningMu.Unlock()
-
 	succeeded := 0
 
 	errs := runParallel(count, func(_ int) error {
-		vmid, err := ig.deployInstance(ctx, template, cloneMu)
+		vmid, err := ig.deployInstance(ctx, template)
 		if err != nil {
 			ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
 

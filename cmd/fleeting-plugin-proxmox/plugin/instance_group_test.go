@@ -278,9 +278,9 @@ func (c *increaseRequestCounts) configsFor(vmid int) []map[string]any {
 	return c.byVMID[vmid]
 }
 
-// increaseTestCloneVMIDs are the vmids /cluster/nextid hands out, in order. Increase
-// serialises the nextid/clone pair under its clone mutex, so the first of these is always the
-// one whose clone POST is refused and the second is always the one that deploys.
+// increaseTestCloneVMIDs are the vmids /cluster/nextid hands out, in order. cloneTemplate
+// serialises the nextid/clone pair under the cloning mutex, so the first of these is always
+// the one whose clone POST is refused and the second is always the one that deploys.
 func increaseTestCloneVMIDs() []int {
 	return []int{100, 101}
 }
@@ -741,6 +741,159 @@ func TestIncreasePreservesTemplateTags(t *testing.T) {
 		vmOptName: DefaultInstanceNameRunning,
 		vmOptTags: "template-tag,manual-tag,fleeting-running",
 	}, deployed[1])
+}
+
+// While Increase waits on the clone task, the cloning mutex must already be free: the mutex
+// guards the pool listings against an in-flight clone POST, not the minutes-long wait that
+// follows it. Holding it for the whole batch would stall the provisioner's Update and
+// Decrease for the entire deployment.
+func TestIncreaseReleasesCloningMutexWhileCloneTaskRuns(t *testing.T) {
+	t.Parallel()
+
+	log, _ := newLogBuffer(t)
+
+	node := increaseTestNode
+	cloneVMID := increaseTestCloneVMIDs()[0]
+
+	var (
+		cloneAccepted    = make(chan struct{})
+		taskUnblock      = make(chan struct{})
+		cloneStatusPings atomic.Int64
+	)
+
+	constant := func(body string) http.HandlerFunc {
+		return func(writer http.ResponseWriter, _ *http.Request) { fmt.Fprint(writer, body) }
+	}
+
+	templateRoute := func(suffix string) string {
+		return fmt.Sprintf("/nodes/%s/qemu/%d/%s", node, increaseTestTemplateID, suffix)
+	}
+
+	cloneRoute := func(suffix string) string {
+		return fmt.Sprintf("/nodes/%s/qemu/%d/%s", node, cloneVMID, suffix)
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /pools/", constant(fmt.Sprintf(
+		`{"data":[{"poolid":"%s","members":[%s,%s]}]}`,
+		increaseTestPool,
+		fmt.Sprintf(`{"vmid":%d,"type":"qemu","name":"template","node":%q}`, increaseTestTemplateID, node),
+		fmt.Sprintf(`{"vmid":%d,"type":"qemu","name":"%s","node":%q}`, cloneVMID, DefaultInstanceNameCreating, node))))
+
+	mux.HandleFunc("GET /cluster/status", constant(`{"data":[]}`))
+	mux.HandleFunc("GET /cluster/nextid", constant(fmt.Sprintf(`{"data":"%d"}`, cloneVMID)))
+	mux.HandleFunc("GET /nodes/"+node+"/status", constant(`{"data":{}}`))
+
+	mux.HandleFunc("GET "+templateRoute("status/current"),
+		constant(fmt.Sprintf(`{"data":{"vmid":%d,"name":"template","status":"stopped","template":1}}`, increaseTestTemplateID)))
+	mux.HandleFunc("GET "+templateRoute("config"), constant(`{"data":{"tags":"template-tag"}}`))
+
+	mux.HandleFunc("POST "+templateRoute("clone"), func(writer http.ResponseWriter, _ *http.Request) {
+		close(cloneAccepted)
+
+		fmt.Fprintf(writer, `{"data":%q}`, increaseTestUPID("qmclone", cloneVMID))
+	})
+
+	// The clone task stays running until the test releases it, so Increase sits in its task
+	// wait; every other task the fake hands out is already stopped.
+	mux.HandleFunc("GET /nodes/"+node+"/tasks/", func(writer http.ResponseWriter, request *http.Request) {
+		upid := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/nodes/"+node+"/tasks/"), "/status")
+
+		fields := strings.Split(upid, ":")
+		if len(fields) < 8 {
+			t.Errorf("task route asked for a malformed UPID: %q", upid)
+			http.Error(writer, "malformed upid", http.StatusBadRequest)
+
+			return
+		}
+
+		status := taskStatusStopped
+
+		if fields[5] == "qmclone" {
+			cloneStatusPings.Add(1)
+			<-taskUnblock
+		}
+
+		//nolint:gosec//G705 // test-only mock server: every argument is a fixture value, not user input
+		fmt.Fprintf(writer, `{"data":{"upid":%q,"node":%q,"type":%q,"id":%q,"user":"root@pam","status":%q,"exitstatus":%q}}`,
+			upid, node, fields[5], fields[6], status, taskExitStatusOK)
+	})
+
+	mux.HandleFunc("GET "+cloneRoute("status/current"),
+		constant(fmt.Sprintf(`{"data":{"vmid":%d,"name":"%s","status":"running"}}`, cloneVMID, DefaultInstanceNameCreating)))
+	mux.HandleFunc("GET "+cloneRoute("config"), constant(`{"data":{"tags":"template-tag"}}`))
+
+	mux.HandleFunc("POST "+cloneRoute("config"), func(writer http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(writer, `{"data":%q}`, increaseTestUPID("qmconfig", cloneVMID))
+	})
+	mux.HandleFunc("POST "+cloneRoute("status/start"), func(writer http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(writer, `{"data":%q}`, increaseTestUPID("qmstart", cloneVMID))
+	})
+	mux.HandleFunc("GET "+cloneRoute("agent/get-osinfo"), constant(`{"data":{"result":{}}}`))
+
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	templateID := increaseTestTemplateID
+
+	ig := newWaitTestGroup()
+	ig.Pool = increaseTestPool
+	ig.Storage = increaseTestStorage
+	ig.TemplateID = &templateID
+	ig.InstanceNameCreating = DefaultInstanceNameCreating
+	ig.InstanceNameRunning = DefaultInstanceNameRunning
+	ig.InstanceNameRemoving = DefaultInstanceNameRemoving
+	ig.InstanceTagsCreating = DefaultInstanceNameCreating
+	ig.InstanceTagsRunning = DefaultInstanceNameRunning
+	ig.InstanceTagsRemoving = DefaultInstanceNameRemoving
+	ig.log = log
+	ig.proxmox = proxmox.NewClient(server.URL)
+
+	result := make(chan struct {
+		succeeded int
+		err       error
+	}, 1)
+
+	go func() {
+		succeeded, err := ig.Increase(context.Background(), 1)
+		result <- struct {
+			succeeded int
+			err       error
+		}{succeeded: succeeded, err: err}
+	}()
+
+	select {
+	case <-cloneAccepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the clone POST was never served")
+	}
+
+	// The first clone-task ping is only sent once the clone call returned and Increase is in
+	// its task wait, so by the time it is in flight the mutex must already be released.
+	deadline := time.Now().Add(5 * time.Second)
+	for cloneStatusPings.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if cloneStatusPings.Load() < 1 {
+		t.Fatal("Increase never started waiting on the clone task")
+	}
+
+	if !ig.instanceCloningMu.TryLock() {
+		t.Fatal("the cloning mutex is still held while Increase waits on the clone task")
+	}
+
+	ig.instanceCloningMu.Unlock()
+	close(taskUnblock)
+
+	select {
+	case res := <-result:
+		require.NoError(t, res.err, "the deploy continued after the clone task finished")
+		require.Equal(t, 1, res.succeeded)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Increase did not return after the clone task was released")
+	}
 }
 
 // Update reports each pool member that carries one of this group's names under the state the

@@ -335,7 +335,7 @@ func TestDeployInstanceMarksFailedInstanceForRemoval(t *testing.T) {
 
 			template := deployTestTemplate(t, ig)
 
-			vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+			vmid, err := ig.deployInstance(context.Background(), template)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), step.wantErrPart)
 			require.Contains(t, err.Error(), "marked for removal")
@@ -364,7 +364,7 @@ func TestDeployInstanceCloneFailureLeavesNoInstanceBehind(t *testing.T) {
 
 		template := deployTestTemplate(t, ig)
 
-		vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+		vmid, err := ig.deployInstance(context.Background(), template)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to clone the template")
 		require.Equal(t, -1, vmid)
@@ -379,7 +379,7 @@ func TestDeployInstanceCloneFailureLeavesNoInstanceBehind(t *testing.T) {
 
 		template := deployTestTemplate(t, ig)
 
-		vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+		vmid, err := ig.deployInstance(context.Background(), template)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "TASK ERROR: out of disk space")
 		require.Equal(t, deployTestCloneVMID, vmid)
@@ -401,7 +401,7 @@ func TestDeployInstanceSurvivesFinalRenameFailure(t *testing.T) {
 
 	template := deployTestTemplate(t, ig)
 
-	vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+	vmid, err := ig.deployInstance(context.Background(), template)
 	require.NoError(t, err)
 	require.Equal(t, deployTestCloneVMID, vmid)
 
@@ -426,7 +426,7 @@ func TestDeployInstanceConfigFailureLeavesNoRenameBehind(t *testing.T) {
 
 	template := deployTestTemplate(t, ig)
 
-	vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+	vmid, err := ig.deployInstance(context.Background(), template)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to set creating tags on instance")
 	require.Equal(t, deployTestCloneVMID, vmid)
@@ -441,7 +441,7 @@ func TestDeployInstanceAutoresize(t *testing.T) {
 
 	template := deployTestTemplate(t, ig)
 
-	vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+	vmid, err := ig.deployInstance(context.Background(), template)
 	require.NoError(t, err)
 	require.Equal(t, deployTestCloneVMID, vmid)
 
@@ -470,7 +470,7 @@ func TestDeployInstanceAutoresizeNotApplied(t *testing.T) {
 
 	template := deployTestTemplate(t, ig)
 
-	vmid, err := ig.deployInstance(context.Background(), template, new(sync.Mutex))
+	vmid, err := ig.deployInstance(context.Background(), template)
 	require.ErrorIs(t, err, ErrAutoresizeNotApplied)
 	require.Contains(t, err.Error(), "marked for removal")
 	require.Equal(t, deployTestCloneVMID, vmid)
