@@ -358,8 +358,14 @@ func (ig *InstanceGroup) markInstanceForRemoval(ctx context.Context, instance *p
 }
 
 // markInstancesForRemoval marks every instance in parallel and wakes the collector once,
-// returning each instance's error in its own slot.
+// returning each instance's error in its own slot. An empty batch marks nothing and wakes
+// nothing: the wake costs the collector a trigger wait and a pool listing, and with nothing
+// renamed to removing the round would collect nothing.
 func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances []*proxmox.ClusterResource) []error {
+	if len(instances) == 0 {
+		return nil
+	}
+
 	defer ig.triggerCollection()
 
 	return runParallel(len(instances), func(index int) error {
