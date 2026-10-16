@@ -225,6 +225,38 @@ func TestDecreaseReportsOnlyAttemptedSuccesses(t *testing.T) {
 	}
 }
 
+// A Decrease whose targets are all past the running state has nothing to rename, and a
+// rename is the only thing that would give the collector work, so it must not wake the
+// collector: the wake costs a trigger wait and a pool listing that would find nothing.
+func TestDecreaseWithoutRemovalsDoesNotWakeCollector(t *testing.T) {
+	t.Parallel()
+
+	ig := newRemovalTestGroup(t, removalTestServer{
+		members: []removalTestMember{
+			{vmid: 100, name: DefaultInstanceNameCreating},
+			{vmid: 101, name: DefaultInstanceNameRemoving},
+		},
+	})
+
+	succeeded, err := ig.Decrease(context.Background(), []string{"100", "101"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"101"}, succeeded)
+	require.Empty(t, ig.instanceCollectionTrigger, "a Decrease with nothing to remove woke the collector")
+
+	// Control: a target that is still running gets a rename attempted, and an attempted
+	// batch wakes the collector even though the rename's task then fails.
+	ig = newRemovalTestGroup(t, removalTestServer{
+		members: []removalTestMember{
+			{vmid: 100, name: DefaultInstanceNameRunning},
+		},
+	})
+
+	succeeded, err = ig.Decrease(context.Background(), []string{"100"})
+	require.Empty(t, succeeded)
+	require.ErrorIs(t, err, ErrTaskFailed)
+	require.Len(t, ig.instanceCollectionTrigger, 1, "an attempted rename did not wake the collector")
+}
+
 const (
 	// increaseTestNode is the one node the Increase fake serves: it appears in the pool
 	// listing, in every VM route and inside every task UPID.
