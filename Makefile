@@ -3,7 +3,7 @@ SHELL := bash
 .DELETE_ON_ERROR:
 MAKEFLAGS += --warn-undefined-variables
 MAKEFLAGS += --no-builtin-rules
-.DEFAULT_GOAL := all
+.DEFAULT_GOAL := build
 
 ################################################################################
 # Configurable variables
@@ -20,68 +20,21 @@ define INFO
 endef
 
 ################################################################################
-# All
-all: build
-.PHONY: all
-
-################################################################################
-# Dependencies
-vendor: go.mod go.sum
-	@$(call INFO,"Tidying Go modules")
-	go mod tidy
-	@$(call INFO,"Vendoring Go modules")
-	go mod vendor
-
-tools/go-licenses:
-	@$(call INFO,"Installing tool $(shell basename $@)")
-	GOBIN=$$(realpath $$(dirname $@)) go install github.com/google/go-licenses/v2@v2.0.1
-
+# Linters (and checks)
 tools/golangci-lint:
 	@$(call INFO,"Installing tool $(shell basename $@)")
 	GOBIN=$$(realpath $$(dirname $@)) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
-################################################################################
-# Linters (and checks)
-lint: lint-go check-licenses
-.PHONY: lint
-
-lint-go: vendor tools/golangci-lint
+lint: tools/golangci-lint
 	@$(call INFO,"Linting Go")
 	./tools/golangci-lint run -v
-.PHONY: lint-go
-
-check-licenses: tools/go-licenses vendor
-	@$(call INFO,"Checking third-party licenses")
-	./tools/go-licenses check ./... --include_tests --disallowed_types unknown,forbidden,restricted
-.PHONY: check-licenses
-
-################################################################################
-# Generators
-generate: cmd/fleeting-plugin-proxmox/licenses.txt
-.PHONY: generate
-
-cmd/fleeting-plugin-proxmox/licenses.txt: tools/go-licenses vendor
-	$(eval LICENSES_DIR := $(shell mktemp -d))
-	echo -e "" > $@;
-	@$(call INFO,"Saving licenses")
-	./tools/go-licenses save ./... --include_tests --force --save_path "${LICENSES_DIR}"
-	@$(call INFO,"Generating $@")
-	for FILE_PATH in $$(find "${LICENSES_DIR}" -type f | LC_ALL=C sort); do \
-		echo -e "$${FILE_PATH#${LICENSES_DIR}/}:\n" >> $@; \
-		while read -r LINE; do \
-			echo "	$$LINE" >> $@; \
-		done < $$FILE_PATH; \
-		echo -e "" >> $@; \
-	done
-	@$(call INFO,"Removing temporary directory")
-	rm -rf "${LICENSES_DIR}"
 
 ################################################################################
 # Builds
 build: bin/fleeting-plugin-proxmox
 .PHONY: build
 
-bin/fleeting-plugin-proxmox: vendor $(shell find cmd -name *.go)
+bin/fleeting-plugin-proxmox: $(shell find cmd -name *.go)
 	@$(call INFO,"Building $@")
 	@mkdir -p $(shell dirname $@)
 	GOOS="${GOOS}" GOARCH="${GOARCH}" CGO_ENABLED="${CGO_ENABLED}" go build -ldflags "-w -extldflags '-static'" -o $@ ./cmd/fleeting-plugin-proxmox
@@ -91,7 +44,7 @@ bin/fleeting-plugin-proxmox: vendor $(shell find cmd -name *.go)
 test: unit-test integration-test
 .PHONY: test
 
-unit-test: vendor
+unit-test:
 	@$(call INFO,"Running unit tests")
 	CGO_ENABLED=1 go test -v -race ./cmd/...
 .PHONY: unit-test
@@ -108,9 +61,5 @@ integration-test: bin/fleeting-plugin-proxmox
 # Cleanup
 clean:
 	@$(call INFO,"Cleaning")
-	rm -rf \
-		bin \
-		tools/go-licenses \
-		tools/golangci-lint \
-		vendor
+	rm -rfv bin tools
 .PHONY: clean

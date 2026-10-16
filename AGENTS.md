@@ -15,8 +15,8 @@ It manages "instances" of cloned VMs as instructed by a gitlab-runner process.
 ## Build & Test Commands
 
 ```shell
-make build      # Builds the plugin, automatically vendoring dependencies
-make lint       # Runs code style enforcement and checks for required license updates
+make build      # Builds the plugin
+make lint       # Runs code style enforcement
 make unit-test  # Runs the unit testing suite
 ```
 
