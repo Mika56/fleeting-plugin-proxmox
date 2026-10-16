@@ -11,14 +11,10 @@ import (
 	"gitlab.com/gitlab-org/fleeting/fleeting/plugin"
 )
 
-//go:embed licenses.txt
-var licenses string
-
 func main() {
 	var (
-		showHelp     = flag.Bool("help", false, "Show help and exit")
-		showVersion  = flag.Bool("version", false, "Show version information and exit")
-		showLicenses = flag.Bool("licenses", false, "Show licenses information and exit")
+		showHelp    = flag.Bool("help", false, "Show help and exit")
+		showVersion = flag.Bool("version", false, "Show version information and exit")
 	)
 
 	flag.Parse()
@@ -30,11 +26,6 @@ func main() {
 
 	if *showVersion {
 		printVersion()
-		os.Exit(0)
-	}
-
-	if *showLicenses {
-		printLicenses()
 		os.Exit(0)
 	}
 
@@ -66,8 +57,4 @@ func printVersion() {
 	}
 
 	fmt.Println(version.Full()) //nolint:forbidigo
-}
-
-func printLicenses() {
-	fmt.Println(licenses) //nolint:forbidigo
 }

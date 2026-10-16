@@ -40,7 +40,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: ls -lah cmd/fleeting-plugin-proxmox
-      - run: make -o vendor --always-make bin/fleeting-plugin-proxmox
+      - run: make --always-make bin/fleeting-plugin-proxmox
         env:
           GOOS: ${{matrix.platform.os}}
           GOARCH: ${{matrix.platform.architecture}}
