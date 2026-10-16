@@ -76,6 +76,11 @@ type InstanceGroup struct {
 	// means defaultCollectionTriggerWait. Per-instance for the same test reason.
 	collectionTriggerWait time.Duration `json:"-"`
 
+	// deployedVMLookupWindow caps how long the post-clone lookup retries while Proxmox's
+	// listings lag the finished clone task; zero means proxmoxDeployedVMLookupWindow.
+	// Per-instance so a test can shorten it on its own group without touching shared state.
+	deployedVMLookupWindow time.Duration `json:"-"`
+
 	// Trigger to shutdown collector.
 	collectorShutdownTrigger chan struct{} `json:"-"`
 

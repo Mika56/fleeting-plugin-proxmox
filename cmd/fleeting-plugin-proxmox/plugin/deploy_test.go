@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
@@ -53,15 +54,24 @@ type deployTestOptions struct {
 
 	// storageAvail is the free space, in bytes, the fake reports for the storage.
 	storageAvail uint64
+
+	// poolBodies, when non-empty, are served one per pool request, the last one repeating;
+	// they let a test simulate a listing that lags the clone the way Proxmox's pool can.
+	poolBodies []string
 }
 
 // deployTestCounts records what a deploy asked the fake to do, so a test can assert on the
 // config writes and resizes a deploy performed.
 type deployTestCounts struct {
-	mu      sync.Mutex
-	configs []map[string]any
-	resizes []map[string]any
-	clones  int
+	mu          sync.Mutex
+	configs     []map[string]any
+	resizes     []map[string]any
+	clones      int
+	poolsServed atomic.Int64
+}
+
+func (c *deployTestCounts) poolCount() int64 {
+	return c.poolsServed.Load()
 }
 
 func (c *deployTestCounts) cloneCount() int {
@@ -94,6 +104,28 @@ func (c *deployTestCounts) allResizes() []map[string]any {
 	defer c.mu.Unlock()
 
 	return append([]map[string]any(nil), c.resizes...)
+}
+
+// registerDeployPoolRoute serves the pool's route: the static body, or, when opts.poolBodies
+// is non-empty, one body per request, the last repeating -- so a test can simulate a listing
+// that lags the clone the way Proxmox's pool can. Every request is counted in counts.
+func registerDeployPoolRoute(mux *http.ServeMux, opts deployTestOptions, counts *deployTestCounts, staticBody string) {
+	mux.HandleFunc("GET /pools/", func(writer http.ResponseWriter, _ *http.Request) {
+		requests := int(counts.poolsServed.Add(1))
+
+		body := staticBody
+
+		if len(opts.poolBodies) > 0 {
+			index := requests - 1
+			if index >= len(opts.poolBodies) {
+				index = len(opts.poolBodies) - 1
+			}
+
+			body = opts.poolBodies[index]
+		}
+
+		fmt.Fprint(writer, body)
+	})
 }
 
 // newDeployTestGroup wires an InstanceGroup to an httptest Proxmox serving the whole deploy
@@ -139,7 +171,8 @@ func newDeployTestGroup(t *testing.T, log hclog.Logger, opts deployTestOptions) 
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /pools/", constant(poolBody))
+	registerDeployPoolRoute(mux, opts, counts, poolBody)
+
 	mux.HandleFunc("GET /nodes/"+deployTestNode+"/status", constant(`{"data":{}}`))
 
 	mux.HandleFunc("GET /cluster/status", constant(`{"data":[]}`))
@@ -517,4 +550,108 @@ func TestIncreaseClonesOnlyWhatFitsOnStorage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// deployTestTemplateMember and deployTestCloneMember are the pool member rows the fixture's
+// pool carries, so a test can build a lagging listing from the same data.
+func deployTestTemplateMember() string {
+	return fmt.Sprintf(`{"vmid":%d,"type":"qemu","name":"template","node":%q}`, deployTestTemplateID, deployTestNode)
+}
+
+func deployTestCloneMember() string {
+	return fmt.Sprintf(`{"vmid":%d,"type":"qemu","name":"%s","node":%q}`, deployTestCloneVMID, DefaultInstanceNameCreating, deployTestNode)
+}
+
+// deployTestPoolBody builds a pool body the way the fixture does, from the members it names.
+func deployTestPoolBody(members ...string) string {
+	return fmt.Sprintf(`{"data":[{"poolid":"%s","members":[%s]}]}`, deployTestPool, strings.Join(members, ","))
+}
+
+// The clone task can finish before Proxmox's pool listing carries the new VM: the post-clone
+// lookup retries until the VM is visible, and a lagging listing must not fail a deployment
+// whose clone actually succeeded.
+func TestDeployInstanceRetriesWhileListingsLagTheClone(t *testing.T) {
+	t.Parallel()
+
+	log, _ := newLogBuffer(t)
+
+	ig, counts := newDeployTestGroup(t, log, deployTestOptions{
+		// The first two pool requests lag: the template fetch, then the lookup's first
+		// attempt. The third carries the clone.
+		poolBodies: []string{
+			deployTestPoolBody(deployTestTemplateMember()),
+			deployTestPoolBody(deployTestTemplateMember()),
+			deployTestPoolBody(deployTestTemplateMember(), deployTestCloneMember()),
+		},
+	})
+
+	template := deployTestTemplate(t, ig)
+
+	start := time.Now()
+
+	vmid, err := ig.deployInstance(context.Background(), template)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "a lagging listing must not fail a deployment whose clone succeeded")
+	require.Equal(t, deployTestCloneVMID, vmid)
+	require.GreaterOrEqual(t, counts.poolCount(), int64(3), "the lookup never retried the lagging listing")
+	require.GreaterOrEqual(t, elapsed, deployedVMLookupInterval, "the retry did not wait an interval between attempts")
+	require.Equal(t, 1, counts.cloneCount(), "the lookup retry re-cloned the template")
+}
+
+// A VM the listings never show fails the deployment once the lookup window elapses: the
+// retries are bounded, so a genuinely missing instance cannot hold its slot in the batch.
+func TestDeployInstanceFailsWhenListingsNeverShowTheClone(t *testing.T) {
+	t.Parallel()
+
+	log, _ := newLogBuffer(t)
+
+	ig, _ := newDeployTestGroup(t, log, deployTestOptions{
+		poolBodies: []string{deployTestPoolBody(deployTestTemplateMember())},
+	})
+
+	// Shorten the window on this group only, so the test does not wait a real one.
+	ig.deployedVMLookupWindow = 300 * time.Millisecond
+
+	template := deployTestTemplate(t, ig)
+
+	start := time.Now()
+
+	vmid, err := ig.deployInstance(context.Background(), template)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to find newly deployed instance")
+	require.Equal(t, deployTestCloneVMID, vmid)
+	require.Less(t, elapsed, deployedVMLookupInterval, "the lookup outlived its window")
+}
+
+// A cancelled context ends the lookup retries at once, not at the next interval: the retry
+// sleep must be interruptible, or a Shutdown could sit out a full interval per in-flight
+// deployment.
+func TestDeployInstanceLookupStopsOnContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	log, _ := newLogBuffer(t)
+
+	ig, _ := newDeployTestGroup(t, log, deployTestOptions{
+		poolBodies: []string{deployTestPoolBody(deployTestTemplateMember())},
+	})
+
+	template := deployTestTemplate(t, ig)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+
+	_, err := ig.deployInstance(ctx, template)
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Less(t, elapsed, deployedVMLookupInterval, "the cancellation was noticed only at the next attempt")
 }

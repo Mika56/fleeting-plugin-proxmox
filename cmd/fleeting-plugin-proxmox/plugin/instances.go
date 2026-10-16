@@ -15,6 +15,13 @@ const (
 	proxmoxTaskWaitTimeout   = 5 * time.Minute
 	proxmoxAgentStartTimeout = 2 * time.Minute
 
+	// proxmoxDeployedVMLookupWindow bounds the post-clone lookup retries: the clone task can
+	// finish before Proxmox's pool or node listings include the new VM.
+	proxmoxDeployedVMLookupWindow = 30 * time.Second
+
+	// deployedVMLookupInterval is the pause between post-clone lookup attempts.
+	deployedVMLookupInterval = 2 * time.Second
+
 	vmOptName   = "name"
 	vmOptTags   = "tags"
 	vmOptDigest = "digest"
@@ -36,7 +43,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		return VMID, fmt.Errorf("failed to deploy instance: %w", err)
 	}
 
-	vm, err := ig.getProxmoxVM(ctx, VMID)
+	vm, err := ig.getDeployedVM(ctx, VMID)
 	if err != nil {
 		return VMID, fmt.Errorf("failed to find newly deployed instance vmid='%d': %w", VMID, err)
 	}
@@ -113,6 +120,41 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 	}
 
 	return VMID, nil
+}
+
+// getDeployedVM fetches the VM a finished clone task produced, retrying while Proxmox's
+// listings lag the task: the task can report stopped before the new VM is a member of the
+// pool or of its node's list, and a single lookup failing in that window would fail a
+// deployment whose clone actually succeeded, leaving the instance behind. The retries are
+// bounded by the lookup window and by the caller's context, so a VM that is genuinely
+// missing fails the deployment once the window elapses instead of blocking the batch.
+func (ig *InstanceGroup) getDeployedVM(ctx context.Context, vmid int) (*proxmox.VirtualMachine, error) {
+	window := proxmoxDeployedVMLookupWindow
+	if ig.deployedVMLookupWindow > 0 {
+		window = ig.deployedVMLookupWindow
+	}
+
+	deadline := time.Now().Add(window)
+
+	for attempt := 1; ; attempt++ {
+		vm, err := ig.getProxmoxVM(ctx, vmid)
+		if err == nil {
+			return vm, nil
+		}
+
+		if time.Now().Add(deployedVMLookupInterval).After(deadline) {
+			return nil, err
+		}
+
+		ig.log.Warn("newly cloned instance not visible in the listings yet, retrying the lookup",
+			"vmid", vmid, "attempt", attempt, "err", err)
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context finished while looking up instance vmid='%d': %w", vmid, ctx.Err())
+		case <-time.After(deployedVMLookupInterval):
+		}
+	}
 }
 
 // cloneTemplate clones the template while holding the cloning lock for the duration of the
