@@ -712,33 +712,34 @@ func TestValidateInstanceCoresAndMemory(t *testing.T) {
 	}
 }
 
-func TestValidateVMIDRange(t *testing.T) {
+func TestValidateVMIDBounds(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
 		name    string
-		value   string
+		min     *int
+		max     *int
 		wantErr bool
 	}{
-		{name: "not set", value: ""},
-		{name: "range", value: "10000-10200"},
-		{name: "single VMID", value: "10000-10000"},
-		{name: "Proxmox bounds", value: "100-999999999"},
-		{name: "no dash", value: "10000", wantErr: true},
-		{name: "spaces", value: "10000 - 10200", wantErr: true},
-		{name: "negative", value: "-10-10200", wantErr: true},
-		{name: "below Proxmox minimum", value: "99-200", wantErr: true},
-		{name: "above Proxmox maximum", value: "100-1000000000", wantErr: true},
-		{name: "reversed", value: "10200-10000", wantErr: true},
+		{name: "not set"},
+		{name: "both", min: new(10000), max: new(10200)},
+		{name: "single VMID", min: new(10000), max: new(10000)},
+		{name: "Proxmox bounds", min: new(minProxmoxVMID), max: new(maxProxmoxVMID)},
+		{name: "min only", min: new(10000)},
+		{name: "max only", max: new(10200)},
+		{name: "min below Proxmox minimum", min: new(99), wantErr: true},
+		{name: "max below Proxmox minimum", max: new(99), wantErr: true},
+		{name: "max above Proxmox maximum", max: new(maxProxmoxVMID + 1), wantErr: true},
+		{name: "reversed", min: new(10200), max: new(10000), wantErr: true},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			settings := Settings{VMIDRange: testCase.value}
+			settings := Settings{VMIDMin: testCase.min, VMIDMax: testCase.max}
 
-			err := settings.validateVMIDRange()
+			err := errors.Join(settings.validateVMIDMin(), settings.validateVMIDMax(), settings.validateVMIDBounds())
 			if testCase.wantErr {
 				require.ErrorIs(t, err, ErrSettingInvalidParameter)
 
@@ -748,4 +749,23 @@ func TestValidateVMIDRange(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+// Setting only one bound restricts clones all the same, the other one defaulting to
+// Proxmox's bound; setting neither leaves the VMID to Proxmox.
+func TestVMIDBoundsDefaults(t *testing.T) {
+	t.Parallel()
+
+	lower, upper := 10000, 10200
+
+	_, _, restricted := (&Settings{}).vmidBounds()
+	require.False(t, restricted)
+
+	gotLower, gotUpper, restricted := (&Settings{VMIDMin: &lower}).vmidBounds()
+	require.True(t, restricted)
+	require.Equal(t, []int{lower, maxProxmoxVMID}, []int{gotLower, gotUpper})
+
+	gotLower, gotUpper, restricted = (&Settings{VMIDMax: &upper}).vmidBounds()
+	require.True(t, restricted)
+	require.Equal(t, []int{minProxmoxVMID, upper}, []int{gotLower, gotUpper})
 }

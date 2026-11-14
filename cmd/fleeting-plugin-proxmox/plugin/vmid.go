@@ -18,8 +18,8 @@ const (
 	// once a minute by default, so this leaves it many updates to do so.
 	freedVMIDQuarantine = 15 * time.Minute
 
-	// maxVMIDProbes bounds how many VMIDs past the next free one cloneTemplate probes while
-	// skipping quarantined ones.
+	// maxVMIDProbes bounds how many VMIDs cloneTemplate probes for a free one, past the next
+	// free one while skipping quarantined ones, or between vmid_min and vmid_max.
 	maxVMIDProbes = 1000
 
 	// maxCloneAttempts bounds how many VMIDs cloneTemplate tries when Proxmox refuses a clone
@@ -33,8 +33,8 @@ var (
 	// ErrNoFreeVMID reports that no VMID outside the quarantine was found within maxVMIDProbes.
 	ErrNoFreeVMID = errors.New("no free VMID outside the reuse quarantine")
 
-	// ErrVMIDRangeFull reports that every VMID in vmid_range is taken.
-	ErrVMIDRangeFull = errors.New("no free VMID in vmid_range")
+	// ErrVMIDRangeFull reports that no free VMID was found between vmid_min and vmid_max.
+	ErrVMIDRangeFull = errors.New("no free VMID")
 )
 
 // trackFreed records that the collector has deleted vmid, so cloneTemplate keeps it from new
@@ -93,7 +93,7 @@ func (ig *InstanceGroup) hasQuarantine() bool {
 // allocateVMID returns the VMID the next clone must use, or zero to let the vendor pick
 // Proxmox's next free one. The caller holds the cloning lock.
 func (ig *InstanceGroup) allocateVMID(ctx context.Context) (int, error) {
-	lower, upper, ok := ig.vmidRange()
+	lower, upper, ok := ig.vmidBounds()
 	if ok {
 		return ig.allocateVMIDInRange(ctx, lower, upper)
 	}
@@ -101,33 +101,26 @@ func (ig *InstanceGroup) allocateVMID(ctx context.Context) (int, error) {
 	return ig.nextUnquarantinedVMID(ctx)
 }
 
-// allocateVMIDInRange returns the lowest free VMID of vmid_range that is not quarantined.
-// Proxmox reserves nothing: whether a VMID is free is only known by asking, and another
-// manager can take one at any time, so every candidate is probed. The pool listing only
-// spares the probes of the VMIDs this group's own instances hold.
+// allocateVMIDInRange returns the lowest free VMID between vmid_min and vmid_max that is not
+// quarantined. The cluster's VM listing spares the probes of the VMIDs it shows as used, but
+// it only shows the VMs the plugin may see, and Proxmox reserves nothing: another manager can
+// take a VMID at any time, so every candidate left is still probed, at most maxVMIDProbes.
 //
 // When every free VMID of the range is quarantined, the one freed the longest ago is reused
 // rather than failing the clone: a range sized close to max_instances would otherwise refuse
 // new instances for the whole quarantine after a burst of removals, and the provisioner has
 // most likely forgotten the oldest one by then.
 func (ig *InstanceGroup) allocateVMIDInRange(ctx context.Context, lower, upper int) (int, error) {
-	pool, err := ig.getProxmoxPool(ctx)
+	used, err := ig.listUsedVMIDs(ctx)
 	if err != nil {
 		return 0, err
 	}
 
-	used := make(map[int]bool, len(pool.Members))
-
-	for _, member := range pool.Members {
-		//nolint:gosec//G115 // member.VMID is a Proxmox VMID, which always fits in an int
-		used[int(member.VMID)] = true
-	}
-
-	fallback := 0
+	fallback, probes := 0, 0
 
 	var fallbackFreedAt time.Time
 
-	for candidate := lower; candidate <= upper; candidate++ {
+	for candidate := lower; candidate <= upper && probes < maxVMIDProbes; candidate++ {
 		if used[candidate] {
 			continue
 		}
@@ -136,6 +129,8 @@ func (ig *InstanceGroup) allocateVMIDInRange(ctx context.Context, lower, upper i
 		if quarantined && fallback != 0 && !freedAt.Before(fallbackFreedAt) {
 			continue
 		}
+
+		probes++
 
 		free, err := ig.isVMIDFree(ctx, candidate)
 		if err != nil {
@@ -154,13 +149,33 @@ func (ig *InstanceGroup) allocateVMIDInRange(ctx context.Context, lower, upper i
 	}
 
 	if fallback != 0 {
-		ig.log.Warn("every free VMID in vmid_range was freed recently, reusing the oldest one",
-			"vmid", fallback, "freed_at", fallbackFreedAt, "vmid_range", ig.VMIDRange)
+		ig.log.Warn("every free VMID between vmid_min and vmid_max was freed recently, reusing the oldest one",
+			"vmid", fallback, "freed_at", fallbackFreedAt, "vmid_min", lower, "vmid_max", upper)
 
 		return fallback, nil
 	}
 
-	return 0, fmt.Errorf("%w %q", ErrVMIDRangeFull, ig.VMIDRange)
+	return 0, fmt.Errorf("%w between %d and %d (probed %d)", ErrVMIDRangeFull, lower, upper, probes)
+}
+
+// listUsedVMIDs returns the VMIDs of the guests, VMs and containers, the cluster shows.
+func (ig *InstanceGroup) listUsedVMIDs(ctx context.Context) (map[int]bool, error) {
+	var guests []struct {
+		VMID int `json:"vmid"`
+	}
+
+	err := ig.proxmox.Get(ctx, "/cluster/resources?type=vm", &guests)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the cluster's VMIDs: %w", err)
+	}
+
+	used := make(map[int]bool, len(guests))
+
+	for _, guest := range guests {
+		used[guest.VMID] = true
+	}
+
+	return used, nil
 }
 
 // nextUnquarantinedVMID returns the VMID the next clone must use, or zero to let the vendor

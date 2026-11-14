@@ -121,14 +121,15 @@ func TestNextUnquarantinedVMID(t *testing.T) {
 	require.Zero(t, vmid, "an expired quarantine must leave the choice to the vendor again")
 }
 
-// With vmid_range set, the clone is created with a VMID of the range.
-func TestCloneTemplateUsesVMIDRange(t *testing.T) {
+// With vmid_min and vmid_max set, the clone is created with a VMID between them.
+func TestCloneTemplateUsesVMIDBounds(t *testing.T) {
 	t.Parallel()
 
 	log, _ := newLogBuffer(t)
 
 	ig, counts := newDeployTestGroup(t, log, deployTestOptions{})
-	ig.VMIDRange = "5000-5005"
+	lower, upper := 5000, 5005
+	ig.VMIDMin, ig.VMIDMax = &lower, &upper
 
 	template := deployTestTemplate(t, ig)
 
@@ -144,9 +145,10 @@ func TestCloneTemplateUsesVMIDRange(t *testing.T) {
 	require.Equal(t, []float64{5000}, counts.cloneNewIDs)
 }
 
-// newVMIDRangeTestGroup serves a pool holding poolVMIDs and answers the nextid probe of a
-// VMID as taken when it is in takenVMIDs, as free otherwise. Every probed VMID is recorded.
-func newVMIDRangeTestGroup(t *testing.T, vmidRange string, poolVMIDs, takenVMIDs []int) (*InstanceGroup, *[]string) {
+// newVMIDRangeTestGroup restricts clones to lower..upper (nil leaves a bound unset), lists
+// usedVMIDs as the cluster's guests, and answers the nextid probe of a VMID as taken when it
+// is in takenVMIDs, as free otherwise. Every probed VMID is recorded.
+func newVMIDRangeTestGroup(t *testing.T, lower, upper *int, usedVMIDs, takenVMIDs []int) (*InstanceGroup, *[]string) {
 	t.Helper()
 
 	var (
@@ -154,14 +156,20 @@ func newVMIDRangeTestGroup(t *testing.T, vmidRange string, poolVMIDs, takenVMIDs
 		probes   []string
 	)
 
-	members := make([]string, 0, len(poolVMIDs))
-	for _, vmid := range poolVMIDs {
-		members = append(members, fmt.Sprintf(`{"vmid":%d,"type":"qemu","name":"fleeting-running","node":"pve-node"}`, vmid))
+	guests := make([]string, 0, len(usedVMIDs))
+	for _, vmid := range usedVMIDs {
+		guests = append(guests, fmt.Sprintf(`{"id":"qemu/%d","type":"qemu","vmid":%d,"node":"pve-node"}`, vmid, vmid))
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /pools/", func(writer http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(writer, `{"data":[{"poolid":"test-pool","members":[%s]}]}`, strings.Join(members, ","))
+	mux.HandleFunc("GET /cluster/resources", func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("type") != "vm" {
+			http.Error(writer, "unexpected resources filter", http.StatusInternalServerError)
+
+			return
+		}
+
+		fmt.Fprintf(writer, `{"data":[%s]}`, strings.Join(guests, ","))
 	})
 	mux.HandleFunc("GET /cluster/nextid", func(writer http.ResponseWriter, request *http.Request) {
 		probe := request.URL.Query().Get("vmid")
@@ -192,28 +200,47 @@ func newVMIDRangeTestGroup(t *testing.T, vmidRange string, poolVMIDs, takenVMIDs
 	t.Cleanup(server.Close)
 
 	ig := newWaitTestGroup()
-	ig.Pool = removalTestPool
-	ig.VMIDRange = vmidRange
+	ig.VMIDMin, ig.VMIDMax = lower, upper
 	ig.proxmox = proxmox.NewClient(server.URL)
 
 	return ig, &probes
 }
 
-// With vmid_range set, the clone takes the lowest VMID of the range that is free and not
-// quarantined: the group's own instances are skipped without a probe, and a VMID another
-// manager holds is skipped on Proxmox's answer.
+// With vmid_min and vmid_max set, the clone takes the lowest VMID between them that is free
+// and not quarantined: VMIDs the cluster lists as used are skipped without a probe, and a
+// VMID the plugin cannot see but another client holds is skipped on Proxmox's answer.
 func TestAllocateVMIDInRange(t *testing.T) {
 	t.Parallel()
 
-	ig, probes := newVMIDRangeTestGroup(t, "10000-10010", []int{10000, 10001}, []int{10002})
+	ig, probes := newVMIDRangeTestGroup(t, new(10000), new(10010), []int{10000, 10001}, []int{10002})
 
 	ig.trackFreed(10003)
 
 	vmid, err := ig.allocateVMID(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 10004, vmid)
-	require.NotContains(t, *probes, "10000", "the group's own instances need no probe")
+	require.NotContains(t, *probes, "10000", "VMIDs the cluster lists as used need no probe")
 	require.NotContains(t, *probes, "", "the range must not fall back to Proxmox's next free VMID")
+}
+
+// With only one bound set, the other one is Proxmox's: only vmid_max set starts from VMID 100,
+// skipping the cluster's used VMIDs without probing them; only vmid_min set has no upper limit
+// short of Proxmox's.
+func TestAllocateVMIDWithOneBound(t *testing.T) {
+	t.Parallel()
+
+	maxOnly, probes := newVMIDRangeTestGroup(t, nil, new(10000), []int{100, 101, 102}, nil)
+
+	vmid, err := maxOnly.allocateVMID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 103, vmid)
+	require.Equal(t, []string{"103"}, *probes)
+
+	minOnly, _ := newVMIDRangeTestGroup(t, new(999999998), nil, []int{999999998}, nil)
+
+	vmid, err = minOnly.allocateVMID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, maxProxmoxVMID, vmid)
 }
 
 // When every free VMID of the range is quarantined, the one freed the longest ago is reused
@@ -221,7 +248,7 @@ func TestAllocateVMIDInRange(t *testing.T) {
 func TestAllocateVMIDInRangeWhenOnlyQuarantinedVMIDsAreFree(t *testing.T) {
 	t.Parallel()
 
-	ig, _ := newVMIDRangeTestGroup(t, "10000-10003", []int{10000}, []int{10001})
+	ig, _ := newVMIDRangeTestGroup(t, new(10000), new(10003), []int{10000}, []int{10001})
 
 	ig.trackFreed(10002)
 	ig.trackFreed(10003)
@@ -234,10 +261,27 @@ func TestAllocateVMIDInRangeWhenOnlyQuarantinedVMIDsAreFree(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 10003, vmid, "the VMID freed the longest ago must be reused")
 
-	full, _ := newVMIDRangeTestGroup(t, "10000-10002", []int{10000, 10001}, []int{10002})
+	full, _ := newVMIDRangeTestGroup(t, new(10000), new(10002), []int{10000, 10001}, []int{10002})
 
 	_, err = full.allocateVMID(context.Background())
 	require.ErrorIs(t, err, ErrVMIDRangeFull)
+}
+
+// The probes are bounded: a range whose VMIDs Proxmox all reports as taken, although the
+// cluster listing shows none of them, fails after maxVMIDProbes.
+func TestAllocateVMIDInRangeBoundsProbes(t *testing.T) {
+	t.Parallel()
+
+	taken := make([]int, 0, maxVMIDProbes+1)
+	for vmid := 10000; vmid <= 10000+maxVMIDProbes; vmid++ {
+		taken = append(taken, vmid)
+	}
+
+	ig, probes := newVMIDRangeTestGroup(t, new(10000), nil, nil, taken)
+
+	_, err := ig.allocateVMID(context.Background())
+	require.ErrorIs(t, err, ErrVMIDRangeFull)
+	require.Len(t, *probes, maxVMIDProbes)
 }
 
 // Proxmox cannot reserve a VMID, so another client can take the one a clone was about to use.
